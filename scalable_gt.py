@@ -233,6 +233,7 @@ def gen_gt(
         query = queries[q_idx]
         
         # Collect points from nearby clusters only
+        # TODO: per-cluster generate then merge instead of stacking all candidates at once
         candidate_points = []
         candidate_global_indices = []
         
@@ -466,6 +467,7 @@ def run_streaming_benchmark(config: BenchmarkConfig, verbose: bool = True) -> di
 
     for batch_num in tqdm(range(num_batches), desc="Building index in data batches"):
         # Generate batch
+        # TODO: not shuffling and extending per cluster may be an issue for some algorithms
         vectors, _ = gen_batch(batch_num, config.batch_size, config.total_rows, cluster_config)
         total_indexed += len(vectors)
         # Build or extend index
@@ -473,15 +475,6 @@ def run_streaming_benchmark(config: BenchmarkConfig, verbose: bool = True) -> di
             ann_index.build(vectors)
         else:
             ann_index.extend(vectors)
-
-    # ===for debugging===
-    all_vectors = []
-    points_per_cluster = get_num_points_per_cluster(config.total_rows, cluster_config)
-    for cluster_id in tqdm(range(cluster_config.nclusters)):
-        cluster_points = gen_cluster(cluster_id, points_per_cluster[cluster_id], cluster_config)
-        all_vectors.append(cluster_points)
-    all_data = np.vstack(all_vectors).astype(np.float32)
-    # ===for debugging===
 
     build_time = time.perf_counter() - build_start
     results['build_time_sec'] = build_time
@@ -508,9 +501,6 @@ def run_streaming_benchmark(config: BenchmarkConfig, verbose: bool = True) -> di
     )
     gt_time = time.perf_counter() - gt_start
     results['gt_time_sec'] = gt_time
-
-    print(f"gt_indices[0]: {gt_indices[0]}")
-    print(f"gt_distances[0]: {gt_distances[0]}")
 
     # Estimate how many points we actually searched for GT
     points_per_cluster = get_num_points_per_cluster(config.total_rows, cluster_config)
@@ -540,7 +530,6 @@ def run_streaming_benchmark(config: BenchmarkConfig, verbose: bool = True) -> di
         gt_indices, gt_distances
     )
     results['recall'] = recall
-    
     
     # -------------------------------------------------------------------------
     # Summary
