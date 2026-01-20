@@ -1,0 +1,10 @@
+*.png
+__pycache__/
+*.npz
+*bin
+*joblib
+*.log
+subsampled_data/
+saved_gmm/
+pareto_curves/
+cluster_stats/
