@@ -917,8 +917,6 @@ if __name__ == "__main__":
             cluster_maxs=maxs,
         )
         
-        print(f"✅ Using normal distribution")
-        
         # Generate mock data
         print("Generating mock data...")
         mock_data = generate_mock_data(cluster_config, len(original_data))
@@ -932,8 +930,8 @@ if __name__ == "__main__":
         else:
             gmm_method = None
     
-    # Analyze distance-to-centroid distributions (validates mock data quality)
-    dist_analysis = analyze_data_to_centroid_distances(original_data, mock_data, centroids)
+    # # Analyze distance-to-centroid distributions (validates mock data quality)
+    # dist_analysis = analyze_data_to_centroid_distances(original_data, mock_data, centroids)
     
     # Compare (both use brute force GT for fair comparison)
     actual_subsample_size = len(original_data) if args.subsample < 0 else args.subsample

@@ -261,7 +261,7 @@ if __name__ == "__main__":
     
     is_normalized, norms = check_normalized(data, args.tolerance, use_gpu=args.gpu)
     
-    if args.normalize or args.standardscaler:
+    if (not is_normalized and args.normalize) or args.standardscaler:
         print(f"\n{'='*60}")
         print("Normalizing Data")
         print(f"{'='*60}")
