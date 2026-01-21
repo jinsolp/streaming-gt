@@ -620,6 +620,9 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
     if verbose:
         print(f"  Built with {len(build_vectors):,} vectors from {(n_sampled_per_cluster > 0).sum()} clusters")
     
+    # # Collect all vectors for debugging
+    # all_vectors = [build_vectors]
+    
     # Step 2b: Extend with remaining vectors (skipping those used in build)
     total_remaining = config.total_rows - n_sampled_per_cluster.sum()
     num_extend_batches = (total_remaining + config.batch_size - 1) // config.batch_size
@@ -632,6 +635,13 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
         if len(vectors) > 0:
             ann_index.extend(vectors)
             total_indexed += len(vectors)
+            all_vectors.append(vectors)
+    
+    # # Stack and save all vectors for verification
+    # all_vectors = np.vstack(all_vectors)
+    # np.save("debug_all_vectors.npy", all_vectors)
+    # if verbose:
+    #     print(f"  DEBUG: Saved all {len(all_vectors):,} vectors to debug_all_vectors.npy")
 
     build_time = time.perf_counter() - build_start
     results['build_time_sec'] = build_time
@@ -816,7 +826,6 @@ if __name__ == "__main__":
     
     # Create the ANN index
     build_params = cagra.IndexParams(
-        metric="sqeuclidean",
         intermediate_graph_degree=256,
         graph_degree=128,
         build_algo="nn_descent",
