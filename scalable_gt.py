@@ -83,6 +83,139 @@ def get_num_points_per_cluster(total_points: int, config: ClusterConfig, min_poi
     return points_per_cluster
 
 
+def gen_build_sample(
+    sample_size: int,
+    total_rows: int,
+    config: ClusterConfig
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate a build sample that includes vectors from ALL clusters proportionally.
+    
+    This ensures the initial index build has representative data from every cluster,
+    which is important for algorithms that use build data to set up internal structures.
+    
+    Args:
+        sample_size: Total number of vectors to sample for build
+        total_rows: Total dataset size
+        config: Cluster configuration
+    
+    Returns:
+        vectors: (sample_size, ncols) array of vectors
+        cluster_ids: (sample_size,) array of cluster assignments
+        n_sampled_per_cluster: (nclusters,) how many vectors sampled from each cluster
+    """
+    points_per_cluster = get_num_points_per_cluster(total_rows, config)
+    
+    # Calculate how many to sample from each cluster
+    # Sample proportionally based on cluster sizes, with minimum 1 per cluster if possible
+    base_per_cluster = sample_size // config.nclusters
+    n_sampled_per_cluster = np.minimum(
+        np.full(config.nclusters, base_per_cluster, dtype=np.int64),
+        points_per_cluster
+    )
+    
+    # Distribute remaining samples to clusters that have capacity
+    remaining = sample_size - n_sampled_per_cluster.sum()
+    for cluster_id in range(config.nclusters):
+        if remaining <= 0:
+            break
+        capacity = points_per_cluster[cluster_id] - n_sampled_per_cluster[cluster_id]
+        add = min(remaining, capacity)
+        n_sampled_per_cluster[cluster_id] += add
+        remaining -= add
+    
+    # Generate sampled vectors from each cluster (take first N from each)
+    vectors = []
+    cluster_ids = []
+    
+    for cluster_id in range(config.nclusters):
+        n_sample = n_sampled_per_cluster[cluster_id]
+        if n_sample > 0:
+            # Generate full cluster and take first n_sample vectors
+            n_cluster_points = points_per_cluster[cluster_id]
+            cluster_points = gen_cluster(cluster_id, n_cluster_points, config)
+            vectors.append(cluster_points[:n_sample])
+            cluster_ids.append(np.full(n_sample, cluster_id, dtype=np.int32))
+    
+    vectors = np.vstack(vectors).astype(np.float32)
+    cluster_ids = np.concatenate(cluster_ids)
+    
+    return vectors, cluster_ids, n_sampled_per_cluster
+
+
+def gen_extend_batch(
+    batch_num: int,
+    batch_size: int,
+    total_rows: int,
+    config: ClusterConfig,
+    n_sampled_per_cluster: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate a batch of vectors for extend, skipping vectors already used in build.
+    
+    Args:
+        batch_num: Batch number (0-indexed, for the extend phase)
+        batch_size: Number of vectors per batch
+        total_rows: Total dataset size
+        config: Cluster configuration
+        n_sampled_per_cluster: How many vectors were sampled from each cluster for build
+    
+    Returns:
+        vectors: (batch_size, ncols) array of vectors
+        cluster_ids: (batch_size,) array of cluster assignments
+    """
+    points_per_cluster = get_num_points_per_cluster(total_rows, config)
+    remaining_per_cluster = points_per_cluster - n_sampled_per_cluster
+    
+    # Calculate cumulative sum for remaining vectors
+    cumsum_remaining = np.cumsum(remaining_per_cluster)
+    total_remaining = cumsum_remaining[-1]
+    
+    start_idx = batch_num * batch_size
+    end_idx = min(start_idx + batch_size, total_remaining)
+    actual_batch_size = end_idx - start_idx
+    if actual_batch_size <= 0:
+        return np.array([]).reshape(0, config.ncols), np.array([])
+    
+    vectors = []
+    cluster_ids = []
+    
+    for cluster_id in range(config.nclusters):
+        cluster_start = 0 if cluster_id == 0 else cumsum_remaining[cluster_id - 1]
+        cluster_end = cumsum_remaining[cluster_id]
+        
+        if cluster_start >= end_idx:
+            break
+        if cluster_end <= start_idx:
+            continue
+        
+        # This cluster overlaps with batch range
+        overlap_start = max(start_idx, cluster_start)
+        overlap_end = min(end_idx, cluster_end)
+        
+        # Generate full cluster, then slice the portion we need
+        # Skip the first n_sampled vectors (already used in build)
+        n_cluster_points = points_per_cluster[cluster_id]
+        cluster_points = gen_cluster(cluster_id, n_cluster_points, config)
+        
+        # Local indices within the REMAINING portion of this cluster
+        local_start = overlap_start - cluster_start
+        local_end = overlap_end - cluster_start
+        
+        # Offset by n_sampled to skip build vectors
+        offset = n_sampled_per_cluster[cluster_id]
+        vectors.append(cluster_points[offset + local_start:offset + local_end])
+        cluster_ids.append(np.full(local_end - local_start, cluster_id, dtype=np.int32))
+    
+    if len(vectors) == 0:
+        return np.array([]).reshape(0, config.ncols), np.array([])
+    
+    vectors = np.vstack(vectors).astype(np.float32)
+    cluster_ids = np.concatenate(cluster_ids)
+    
+    return vectors, cluster_ids
+
+
 def gen_batch(
     batch_num: int,
     batch_size: int,
@@ -225,45 +358,56 @@ def gen_gt(
     # Find nearby clusters for each query
     nearby_clusters = find_nearby_clusters(queries, config, nprobes, backend, metric)
 
-    # Compute ground truth by only searching nearby clusters
+    # Compute ground truth by iterating over clusters (more efficient)
+    # For each cluster, batch process all queries that have it as a nearby cluster
     gt_indices = np.full((nqueries, k), -1, dtype=np.int64)
     gt_distances = np.full((nqueries, k), np.inf, dtype=np.float32)
     
-    for q_idx in tqdm(range(nqueries), desc="Computing ground truth for each query"):
-        query = queries[q_idx]
-        
-        # Collect points from nearby clusters only
-        # TODO: per-cluster generate then merge instead of stacking all candidates at once
-        candidate_points = []
-        candidate_global_indices = []
-        
+    # Build reverse mapping: cluster_id -> list of query indices that need this cluster
+    cluster_to_queries = {}
+    for q_idx in tqdm(range(nqueries), desc="Building reverse mapping"):
         for cluster_id in nearby_clusters[q_idx]:
             cluster_id = int(cluster_id)
-            n_points = points_per_cluster[cluster_id]
-            
-            # Generate this cluster's points
-            cluster_points = gen_cluster(cluster_id, n_points, config)
-            
-            # Calculate global indices for this cluster's points
-            global_start = 0 if cluster_id == 0 else cumsum[cluster_id - 1]
-            global_indices = np.arange(global_start, global_start + n_points)
-            
-            candidate_points.append(cluster_points)
-            candidate_global_indices.append(global_indices)
+            if cluster_id not in cluster_to_queries:
+                cluster_to_queries[cluster_id] = []
+            cluster_to_queries[cluster_id].append(q_idx)
+    
+    # Process each cluster once
+    for cluster_id in tqdm(cluster_to_queries.keys(), desc="Processing clusters for GT"):
+        query_indices = cluster_to_queries[cluster_id]
+        n_points = points_per_cluster[cluster_id]
         
-        # Stack all candidates
-        all_candidates = np.vstack(candidate_points)
-        all_indices = np.concatenate(candidate_global_indices)
-        # Brute force on this smaller subset
+        # Generate this cluster's points (only once!)
+        cluster_points = gen_cluster(cluster_id, n_points, config)
+        
+        # Calculate global index offset for this cluster
+        global_start = 0 if cluster_id == 0 else cumsum[cluster_id - 1]
+        
+        # Gather queries that need this cluster
+        batch_queries = queries[query_indices]  # (num_queries_for_cluster, ncols)
+        
+        # Brute force KNN: batch_queries vs cluster_points
+        k_cluster = min(k, n_points)
         local_indices, local_dists = brute_force_knn(
-            all_candidates, 
-            query.reshape(1, -1), 
-            k,
+            cluster_points,
+            batch_queries,
+            k_cluster,
             backend=backend
         )
-
-        gt_indices[q_idx] = all_indices[local_indices[0]]
-        gt_distances[q_idx] = local_dists[0]
+        
+        # Convert local indices to global indices
+        global_indices = local_indices + global_start  # (num_queries, k_cluster)
+        
+        # Merge results for each query in this batch
+        for i, q_idx in enumerate(query_indices):
+            # Combine current top-k with new cluster results
+            merged_indices = np.concatenate([gt_indices[q_idx], global_indices[i]])
+            merged_dists = np.concatenate([gt_distances[q_idx], local_dists[i]])
+            
+            # Sort by distance and keep top k
+            sort_order = np.argsort(merged_dists)[:k]
+            gt_indices[q_idx] = merged_indices[sort_order]
+            gt_distances[q_idx] = merged_dists[sort_order]
 
     return queries, gt_indices, gt_distances
 
@@ -413,7 +557,7 @@ def verify_clustering_gt_accuracy(
 # Streaming Benchmark
 # =============================================================================
 
-def run_streaming_benchmark(config: BenchmarkConfig, verbose: bool = True) -> dict:
+def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, verbose: bool = True) -> dict:
     """
     Streaming ANN benchmark without storing the full dataset.
     
@@ -460,21 +604,34 @@ def run_streaming_benchmark(config: BenchmarkConfig, verbose: bool = True) -> di
         raise ValueError("ann_index must be provided in BenchmarkConfig")
     ann_index = config.ann_index
     
-    num_batches = (config.total_rows + config.batch_size - 1) // config.batch_size
     total_indexed = 0
-    
     build_start = time.perf_counter()
 
-    for batch_num in tqdm(range(num_batches), desc="Building index in data batches"):
-        # Generate batch
-        # TODO: not shuffling and extending per cluster may be an issue for some algorithms
-        vectors, _ = gen_batch(batch_num, config.batch_size, config.total_rows, cluster_config)
-        total_indexed += len(vectors)
-        # Build or extend index
-        if batch_num == 0:
-            ann_index.build(vectors)
-        else:
+    # Step 2a: Build with sample from ALL clusters (ensures representative initial index)
+    if verbose:
+        print(f"  Building initial index with sample from all clusters...")
+    build_vectors, _, n_sampled_per_cluster = gen_build_sample(
+        sample_size=config.batch_size,
+        total_rows=config.total_rows,
+        config=cluster_config
+    )
+    ann_index.build(build_vectors)
+    total_indexed += len(build_vectors)
+    if verbose:
+        print(f"  Built with {len(build_vectors):,} vectors from {(n_sampled_per_cluster > 0).sum()} clusters")
+    
+    # Step 2b: Extend with remaining vectors (skipping those used in build)
+    total_remaining = config.total_rows - n_sampled_per_cluster.sum()
+    num_extend_batches = (total_remaining + config.batch_size - 1) // config.batch_size
+    
+    for batch_num in tqdm(range(num_extend_batches), desc="Extending index with remaining batches"):
+        vectors, _ = gen_extend_batch(
+            batch_num, config.batch_size, config.total_rows, 
+            cluster_config, n_sampled_per_cluster
+        )
+        if len(vectors) > 0:
             ann_index.extend(vectors)
+            total_indexed += len(vectors)
 
     build_time = time.perf_counter() - build_start
     results['build_time_sec'] = build_time
@@ -512,36 +669,61 @@ def run_streaming_benchmark(config: BenchmarkConfig, verbose: bool = True) -> di
         print(f"  GT generation time: {gt_time:.2f}s")
     
     # -------------------------------------------------------------------------
-    # Step 4: Search ANN index and compute recall
+    # Step 4: Search ANN index and compute recall (sweep itopk if provided)
     # -------------------------------------------------------------------------
+    if itopk_list is None:
+        itopk_list = [None]  # Use default search params
+    
     if verbose:
-        print(f"\n[Step 3] Searching {index_name}...")
+        print(f"\n[Step 3] Searching {index_name} with itopk sweep: {itopk_list}...")
     
-    search_start = time.perf_counter()
-    predicted_indices, predicted_distances = ann_index.search(queries, config.k)
-    search_time = time.perf_counter() - search_start
-    results['search_time_sec'] = search_time
-
-    print(f"predicted_indices[0]: {predicted_indices[0]}")
-    print(f"predicted_distances[0]: {predicted_distances[0]}")
+    # Store results for each itopk value
+    pareto_results = []
     
-    recall, _ = compute_recall_with_ties(
-        predicted_indices, predicted_distances,
-        gt_indices, gt_distances
-    )
-    results['recall'] = recall
+    for itopk in itopk_list:
+        # Warmup search (not timed)
+        _ = ann_index.search(queries, config.k, itopk=itopk)
+        
+        # Timed search
+        search_start = time.perf_counter()
+        predicted_indices, predicted_distances = ann_index.search(queries, config.k, itopk=itopk)
+        search_time = time.perf_counter() - search_start
+        
+        recall, _ = compute_recall_with_ties(
+            predicted_indices, predicted_distances,
+            gt_indices, gt_distances
+        )
+        
+        qps = config.nqueries / search_time
+        
+        pareto_results.append({
+            'itopk': itopk,
+            'recall': recall,
+            'search_time_sec': search_time,
+            'qps': qps,
+        })
+        
+        if verbose:
+            itopk_str = itopk if itopk is not None else "default"
+            print(f"  itopk={itopk_str}: recall={recall:.4f}, search_time={search_time:.4f}s, QPS={qps:,.0f}")
+    
+    results['pareto_results'] = pareto_results
     
     # -------------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------------
     if verbose:
         print("\n" + "=" * 60)
-        print("Benchmark Results")
+        print("Benchmark Results Summary")
         print("=" * 60)
-        print(f"  🙌 Recall@{config.k} (with distance ties): {recall:.4f}")
         print(f"  Index build time: {build_time:.2f}s")
         print(f"  GT generation time: {gt_time:.2f}s")
-        print(f"  Search time: {search_time:.4f}s")
+        print(f"\n  Pareto curve data (itopk sweep):")
+        print(f"  {'itopk':>8} {'recall':>10} {'QPS':>12}")
+        print(f"  {'-'*8} {'-'*10} {'-'*12}")
+        for pr in pareto_results:
+            itopk_str = str(pr['itopk']) if pr['itopk'] is not None else "default"
+            print(f"  {itopk_str:>8} {pr['recall']:>10.4f} {pr['qps']:>12,.0f}")
         
         # Memory analysis
         print(f"\n[Memory Analysis]")
@@ -559,12 +741,37 @@ def run_streaming_benchmark(config: BenchmarkConfig, verbose: bool = True) -> di
 # Demo / Test Functions
 # =============================================================================
 
-def demo_benchmark(config: BenchmarkConfig):
+def demo_benchmark(config: BenchmarkConfig, itopk_list: list = None, output_path: str = None):
     """
     Demonstrate the streaming benchmark with example configuration.
-    """
     
-    results = run_streaming_benchmark(config, verbose=True)
+    Args:
+        config: Benchmark configuration
+        itopk_list: List of itopk values to sweep (e.g., [32, 64, 128, 256])
+        output_path: Optional path to save pareto results as .npz file
+    """
+    results = run_streaming_benchmark(config, itopk_list=itopk_list, verbose=True)
+    
+    # Save pareto results if output path provided
+    if output_path is not None and 'pareto_results' in results:
+        pareto = results['pareto_results']
+        itopks = np.array([p['itopk'] if p['itopk'] is not None else 0 for p in pareto])
+        recalls = np.array([p['recall'] for p in pareto])
+        qps_arr = np.array([p['qps'] for p in pareto])
+        search_times = np.array([p['search_time_sec'] for p in pareto])
+        
+        np.savez(
+            output_path,
+            itopk=itopks,
+            recall=recalls,
+            qps=qps_arr,
+            search_time_sec=search_times,
+            k=config.k,
+            nqueries=config.nqueries,
+            total_rows=config.total_rows,
+        )
+        print(f"\nPareto results saved to: {output_path}")
+    
     return results
 
 
@@ -590,7 +797,7 @@ if __name__ == "__main__":
                         help="Random seed (default: 42)")
     parser.add_argument("--batch_size", type=int, default=100_000,
                         help="Batch size for streaming (default: 100K)")
-    parser.add_argument("--nqueries", type=int, default=100,
+    parser.add_argument("--nqueries", type=int, default=1000,
                         help="Number of queries (default: 100)")
     parser.add_argument("--k", type=int, default=16,
                         help="Number of nearest neighbors (default: 16)")
@@ -600,6 +807,10 @@ if __name__ == "__main__":
                         help="Backend for brute force GT computation (default: cuvs)")
     parser.add_argument("--mode", type=str, default="test_gt", choices=["test_gt", "benchmark"],
                         help="Mode: test_gt (verify GT accuracy) or benchmark (streaming ANN benchmark)")
+    parser.add_argument("--itopk", type=int, nargs="+", default=[32, 64, 128, 256],
+                        help="List of itopk values to sweep for Pareto curve (default: 32 64 128 256)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Path to save pareto results as .npz file (optional)")
     
     args = parser.parse_args()
     
@@ -629,4 +840,14 @@ if __name__ == "__main__":
         test_gt_accuracy(config)
     else:
         # Streaming benchmark to compare the performance of different ANN algorithms.
-        demo_benchmark(config)
+        demo_benchmark(config, itopk_list=args.itopk, output_path=args.output)
+    
+    # Explicit GPU cleanup to avoid CUDA errors on exit
+    import gc
+    gc.collect()
+    try:
+        import cupy as cp
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except ImportError:
+        pass

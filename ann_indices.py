@@ -53,24 +53,36 @@ class CagraIndex:
         else:
             self.extend(dataset)
     
-    def search(self, queries: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Search the index for k nearest neighbors."""
+    def search(self, queries: np.ndarray, k: int, itopk: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Search the index for k nearest neighbors.
+        
+        Args:
+            queries: Query vectors
+            k: Number of nearest neighbors to return
+            itopk: Internal top-k size for search (larger = better recall, slower)
+                   If None, uses the value from search_params (default usually 64)
+        """
         queries_device = device_ndarray(queries.astype(np.float32))
         out_idx = np.zeros((queries.shape[0], k), dtype=np.uint32)
         out_dist = np.zeros((queries.shape[0], k), dtype=np.float32)
         out_idx_device = device_ndarray(out_idx)
         out_dist_device = device_ndarray(out_dist)
         
+        # Use custom itopk if provided, otherwise use default search_params
+        if itopk is not None:
+            search_params = cagra.SearchParams(itopk_size=itopk)
+        else:
+            search_params = self.search_params
+        
         cagra.search(
-            self.search_params,
+            search_params,
             self.index,
             queries_device,
             k,
             neighbors=out_idx_device,
             distances=out_dist_device,
         )
-
-        print(f"out_idx_device: {out_idx_device.copy_to_host()}")
         
         return out_idx_device.copy_to_host(), out_dist_device.copy_to_host()
 
