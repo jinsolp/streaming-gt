@@ -446,7 +446,7 @@ def generate_queries_and_gt(
         query_indices = rng.choice(len(data), size=n_queries, replace=False)
         queries = data[query_indices].copy()
         # Add small noise
-        noise_scale = np.std(data) * 0.01
+        noise_scale = np.std(data) * 0.1
         queries += rng.normal(0, noise_scale, queries.shape).astype(np.float32)
     
     # Compute ground truth

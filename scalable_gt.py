@@ -331,29 +331,38 @@ def gen_gt(
     points_per_cluster = get_num_points_per_cluster(total_rows, config)
     cumsum = np.cumsum(points_per_cluster)
     
-    # Generate query points deterministically
-    # Queries come from random clusters (weighted by density)
+    # Generate query points by sampling from actual data points (like compare_pareto.py)
     query_rng = np.random.default_rng(config.seed + query_seed_offset)
     
-    # Sample which clusters queries come from
-    query_cluster_ids = query_rng.choice(
-        config.nclusters, 
-        size=nqueries, 
-        p=config.cluster_densities
-    )
+    # Sample global indices uniformly from the dataset
+    query_global_indices = query_rng.choice(total_rows, size=nqueries, replace=False)
     
-    # Generate query points from their respective clusters
-    queries = []
-    for i, cluster_id in enumerate(query_cluster_ids):
-        # Use a unique seed for each query point
-        q_seed = config.seed + query_seed_offset + i + 1
-        q_rng = np.random.default_rng(q_seed)
-        center = config.cluster_centers[cluster_id]
-        variance = config.cluster_variances[cluster_id]
-        q = q_rng.normal(loc=center, scale=np.sqrt(variance), size=(config.ncols,))
-        queries.append(q)
+    # Convert global indices to (cluster_id, local_index) pairs
+    # For each global index, find which cluster it belongs to
+    query_cluster_ids = np.searchsorted(cumsum, query_global_indices, side='right')
     
-    queries = np.array(queries, dtype=np.float32)
+    # Group queries by cluster to generate efficiently
+    cluster_to_query_info = {}  # cluster_id -> list of (query_idx, local_index)
+    for q_idx, (global_idx, cluster_id) in enumerate(zip(query_global_indices, query_cluster_ids)):
+        local_idx = global_idx if cluster_id == 0 else global_idx - cumsum[cluster_id - 1]
+        if cluster_id not in cluster_to_query_info:
+            cluster_to_query_info[cluster_id] = []
+        cluster_to_query_info[cluster_id].append((q_idx, local_idx))
+    
+    # Generate query points from actual data
+    queries = np.zeros((nqueries, config.ncols), dtype=np.float32)
+    for cluster_id, query_info_list in cluster_to_query_info.items():
+        # Generate the full cluster (we need specific indices from it)
+        n_points = points_per_cluster[cluster_id]
+        cluster_points = gen_cluster(cluster_id, n_points, config)
+        
+        # Extract the specific points for queries
+        for q_idx, local_idx in query_info_list:
+            queries[q_idx] = cluster_points[local_idx]
+    
+    # Add small noise to avoid exact matches (like compare_pareto.py)
+    noise_scale = np.std(queries) * 0.1
+    queries += query_rng.normal(0, noise_scale, queries.shape).astype(np.float32)
 
     # Find nearby clusters for each query
     nearby_clusters = find_nearby_clusters(queries, config, nprobes, backend, metric)
@@ -620,9 +629,6 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
     if verbose:
         print(f"  Built with {len(build_vectors):,} vectors from {(n_sampled_per_cluster > 0).sum()} clusters")
     
-    # # Collect all vectors for debugging
-    # all_vectors = [build_vectors]
-    
     # Step 2b: Extend with remaining vectors (skipping those used in build)
     total_remaining = config.total_rows - n_sampled_per_cluster.sum()
     num_extend_batches = (total_remaining + config.batch_size - 1) // config.batch_size
@@ -635,13 +641,6 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
         if len(vectors) > 0:
             ann_index.extend(vectors)
             total_indexed += len(vectors)
-            all_vectors.append(vectors)
-    
-    # # Stack and save all vectors for verification
-    # all_vectors = np.vstack(all_vectors)
-    # np.save("debug_all_vectors.npy", all_vectors)
-    # if verbose:
-    #     print(f"  DEBUG: Saved all {len(all_vectors):,} vectors to debug_all_vectors.npy")
 
     build_time = time.perf_counter() - build_start
     results['build_time_sec'] = build_time
