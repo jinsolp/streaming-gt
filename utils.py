@@ -37,6 +37,31 @@ def cuvs_brute_force_knn(
     return indices.copy_to_host(), distances.copy_to_host()
 
 
+def cuvs_brute_force_knn_gpu(
+    database: cp.ndarray, 
+    queries: cp.ndarray, 
+    k: int, 
+    metric: str = "sqeuclidean"
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute k-nearest neighbors using brute force on GPU.
+    Accepts CuPy arrays directly to avoid CPU->GPU transfer overhead.
+    
+    Args:
+        database: CuPy array (n, d) of database vectors (already on GPU)
+        queries: CuPy array (m, d) of query vectors (already on GPU)
+        k: number of nearest neighbors
+        metric: distance metric
+    
+    Returns:
+        indices: NumPy array (m, k) of neighbor indices
+        distances: NumPy array (m, k) of neighbor distances
+    """
+    index = brute_force.build(database, metric=metric)
+    distances, indices = brute_force.search(index, queries, k)
+    return indices.copy_to_host(), distances.copy_to_host()
+
+
 def sklearn_brute_force_knn(
     database: np.ndarray, 
     queries: np.ndarray, 

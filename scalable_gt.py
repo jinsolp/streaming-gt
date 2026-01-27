@@ -7,13 +7,14 @@ Key idea: Generate clustered data deterministically so we can:
 """
 
 import numpy as np
-from typing import Tuple, List, Literal
+import cupy as cp
+from typing import Tuple, List, Literal, Optional, Union
 from tqdm import tqdm
 from cuvs.neighbors import cagra
 
 from config import ClusterConfig, BenchmarkConfig, get_cluster_config
 from ann_indices import CagraIndex, IvfPqIndex
-from utils import brute_force_knn, compute_recall, compute_recall_with_ties, plot_clusters_2d, print_config
+from utils import brute_force_knn, cuvs_brute_force_knn_gpu, compute_recall, compute_recall_with_ties, plot_clusters_2d, print_config
 
 
 # =============================================================================
@@ -30,7 +31,7 @@ def get_cluster_seed(base_seed: int, cluster_id: int) -> int:
 
 def gen_cluster(cluster_id: int, n_points: int, config: ClusterConfig) -> np.ndarray:
     """
-    Generate points for a single cluster deterministically using normal distribution.
+    Generate points for a single cluster deterministically using normal distribution (CPU).
     Same cluster_id + config always produces identical points.
     
     Supports:
@@ -50,6 +51,50 @@ def gen_cluster(cluster_id: int, n_points: int, config: ClusterConfig) -> np.nda
     points = rng.normal(loc=center, scale=scale, size=(n_points, config.ncols))
     
     return points.astype(np.float32)
+
+
+def gen_cluster_gpu(cluster_id: int, n_points: int, config: ClusterConfig, return_cupy: bool = True) -> Union[cp.ndarray, np.ndarray]:
+    """
+    Generate points for a single cluster deterministically using GPU (CuPy).
+    Same cluster_id + config always produces identical points (within GPU implementation).
+    
+    Note: GPU random numbers will differ from CPU version but are deterministic on GPU.
+    
+    Supports:
+    - Scalar variance per cluster: config.cluster_variances shape (nclusters,)
+    - Per-dimension variance: config.cluster_variances shape (nclusters, ncols)
+    
+    Args:
+        cluster_id: ID of the cluster to generate
+        n_points: Number of points to generate
+        config: Cluster configuration
+        return_cupy: If True, return CuPy array (stays on GPU). If False, return NumPy array.
+    
+    Returns:
+        Generated points as CuPy array (on GPU) or NumPy array (on CPU)
+    """
+    seed = get_cluster_seed(config.seed, cluster_id)
+    
+    # Use CuPy's RandomState for deterministic seeding (compatible API)
+    rng = cp.random.RandomState(seed)
+    
+    # Transfer center and variance to GPU (these are small, can be cached)
+    center = cp.asarray(config.cluster_centers[cluster_id])
+    variance = cp.asarray(config.cluster_variances[cluster_id])
+    
+    # variance can be scalar (single value) or per-dimension array (ncols,)
+    scale = cp.sqrt(variance)
+    
+    # Generate standard normal samples directly into output array
+    # Then transform IN-PLACE to minimize GPU memory usage: X = center + scale * Z
+    # This uses ~30GB instead of ~90GB for large clusters
+    points = rng.standard_normal(size=(n_points, config.ncols), dtype=cp.float32)
+    points *= scale   # In-place multiplication (no new array)
+    points += center  # In-place addition (no new array)
+    
+    if return_cupy:
+        return points
+    return cp.asnumpy(points)
 
 
 def get_num_points_per_cluster(total_points: int, config: ClusterConfig, min_points_per_cluster: int = 1) -> np.ndarray:
@@ -298,6 +343,364 @@ def find_nearby_clusters(
 # Ground Truth Generation
 # =============================================================================
 
+def compute_true_gt_streaming(
+    queries: np.ndarray,
+    cluster_config: ClusterConfig,
+    total_rows: int,
+    k: int,
+    backend: str = "cuvs",
+    use_gpu_gen: bool = True
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Compute true brute-force GT by streaming through ALL clusters.
+    
+    Instead of loading all data into memory, generates each cluster's data
+    on-the-fly, computes brute force, and merges results incrementally.
+    
+    Args:
+        queries: (nqueries, ncols) query vectors
+        cluster_config: Cluster configuration
+        total_rows: Total number of vectors
+        k: Number of nearest neighbors
+        backend: "cuvs" or "sklearn" for brute force
+        use_gpu_gen: If True, use GPU for data generation (faster). Default True.
+    
+    Returns:
+        gt_indices: (nqueries, k) ground truth neighbor indices
+        gt_distances: (nqueries, k) ground truth distances
+        timing: dict with 'gen_time' and 'bf_time' breakdowns
+    """
+    import time
+    
+    nqueries = len(queries)
+    points_per_cluster = get_num_points_per_cluster(total_rows, cluster_config)
+    cumsum = np.cumsum(points_per_cluster)
+    
+    # Initialize running top-k
+    gt_indices = np.full((nqueries, k), -1, dtype=np.int64)
+    gt_distances = np.full((nqueries, k), np.inf, dtype=np.float32)
+    
+    # Track timing
+    total_gen_time = 0.0
+    total_bf_time = 0.0
+    total_merge_time = 0.0
+    
+    # For GPU path: keep queries on GPU to avoid repeated transfers
+    if use_gpu_gen and backend == "cuvs":
+        queries_gpu = cp.asarray(queries)
+    
+    print(f"Computing true GT by streaming through {cluster_config.nclusters} clusters...")
+    
+    # Process each cluster one at a time
+    for cluster_id in tqdm(range(cluster_config.nclusters), desc="Streaming clusters for true GT"):
+        n_points = points_per_cluster[cluster_id]
+        
+        # Calculate global index offset for this cluster
+        global_start = 0 if cluster_id == 0 else cumsum[cluster_id - 1]
+        
+        if use_gpu_gen and backend == "cuvs":
+            # GPU path: generate on GPU and keep data there
+            gen_start = time.perf_counter()
+            cluster_points_gpu = gen_cluster_gpu(cluster_id, n_points, cluster_config, return_cupy=True)
+            total_gen_time += time.perf_counter() - gen_start
+            
+            # Brute force directly on GPU (no CPU->GPU transfer)
+            bf_start = time.perf_counter()
+            k_cluster = min(k, n_points)
+            local_indices, local_dists = cuvs_brute_force_knn_gpu(
+                cluster_points_gpu,
+                queries_gpu,
+                k_cluster
+            )
+            total_bf_time += time.perf_counter() - bf_start
+        else:
+            # CPU path: original behavior
+            gen_start = time.perf_counter()
+            cluster_points = gen_cluster(cluster_id, n_points, cluster_config)
+            total_gen_time += time.perf_counter() - gen_start
+            
+            bf_start = time.perf_counter()
+            k_cluster = min(k, n_points)
+            local_indices, local_dists = brute_force_knn(
+                cluster_points,
+                queries,
+                k_cluster,
+                backend=backend
+            )
+            total_bf_time += time.perf_counter() - bf_start
+        
+        # Convert local indices to global indices
+        global_indices = local_indices + global_start
+        
+        # Time: Merge results for each query
+        merge_start = time.perf_counter()
+        for q_idx in range(nqueries):
+            merged_indices = np.concatenate([gt_indices[q_idx], global_indices[q_idx]])
+            merged_dists = np.concatenate([gt_distances[q_idx], local_dists[q_idx]])
+            sort_order = np.argsort(merged_dists)[:k]
+            gt_indices[q_idx] = merged_indices[sort_order]
+            gt_distances[q_idx] = merged_dists[sort_order]
+        total_merge_time += time.perf_counter() - merge_start
+    
+    timing = {'gen_time': total_gen_time, 'bf_time': total_bf_time, 'merge_time': total_merge_time}
+    return gt_indices, gt_distances, timing
+
+
+def generate_queries_and_gt_batched(
+    data: np.ndarray,
+    n_queries: int,
+    k: int,
+    batch_size: int = 1_000_000,
+    seed: int = 12345,
+    backend: str = "cuvs",
+    queries: Optional[np.ndarray] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate queries and compute ground truth via batched brute force.
+    
+    For large datasets (e.g., 50M vectors), processes data in batches and 
+    merges results incrementally to avoid OOM.
+    
+    Args:
+        data: Dataset to query (can be very large)
+        n_queries: Number of queries
+        k: Number of nearest neighbors
+        batch_size: Number of vectors to process per batch
+        seed: Random seed
+        backend: "cuvs" or "sklearn" for brute force
+        queries: Optional pre-generated queries (if None, samples from data)
+    
+    Returns:
+        queries: (n_queries, ncols)
+        gt_indices: (n_queries, k)
+        gt_distances: (n_queries, k)
+    """
+    n_rows = len(data)
+    
+    if queries is None:
+        rng = np.random.default_rng(seed)
+        
+        # Sample queries from the dataset (with small noise to avoid exact matches)
+        query_indices = rng.choice(n_rows, size=n_queries, replace=False)
+        queries = data[query_indices].copy()
+        # Add small noise
+        noise_scale = np.std(data[:min(100000, n_rows)]) * 0.1  # Use subset for std to avoid loading all data
+        queries += rng.normal(0, noise_scale, queries.shape).astype(np.float32)
+    
+    # Initialize running top-k
+    gt_indices = np.full((n_queries, k), -1, dtype=np.int64)
+    gt_distances = np.full((n_queries, k), np.inf, dtype=np.float32)
+    
+    num_batches = (n_rows + batch_size - 1) // batch_size
+    print(f"Computing batched GT for {n_queries} queries over {n_rows:,} vectors ({num_batches} batches)...")
+    
+    for batch_num in tqdm(range(num_batches), desc="GT batches"):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, n_rows)
+        batch_data = data[start_idx:end_idx]
+        
+        # Compute brute force KNN for this batch
+        batch_indices, batch_distances = brute_force_knn(batch_data, queries, k, backend=backend)
+        
+        # Convert local batch indices to global indices
+        batch_indices = batch_indices + start_idx
+        
+        # Merge with running top-k
+        for q_idx in range(n_queries):
+            # Concatenate current top-k with batch results
+            merged_indices = np.concatenate([gt_indices[q_idx], batch_indices[q_idx]])
+            merged_distances = np.concatenate([gt_distances[q_idx], batch_distances[q_idx]])
+            
+            # Sort by distance and keep top k
+            sort_order = np.argsort(merged_distances)[:k]
+            gt_indices[q_idx] = merged_indices[sort_order]
+            gt_distances[q_idx] = merged_distances[sort_order]
+    
+    return queries, gt_indices, gt_distances
+
+
+def gen_queries(
+    nqueries: int,
+    total_rows: int,
+    config: ClusterConfig,
+    query_seed_offset: int = 999999,
+    use_gpu_gen: bool = True,
+) -> np.ndarray:
+    """
+    Generate query vectors by sampling from the synthetic dataset.
+    
+    Args:
+        nqueries: Number of query points to generate
+        total_rows: Total dataset size (for calculating points per cluster)
+        config: Cluster configuration
+        query_seed_offset: Offset for query generation seed
+        use_gpu_gen: If True, use GPU for data generation (faster). Default True.
+    
+    Returns:
+        queries: (nqueries, ncols) query vectors
+    """
+    points_per_cluster = get_num_points_per_cluster(total_rows, config)
+    cumsum = np.cumsum(points_per_cluster)
+    
+    # Generate query points by sampling from actual data points
+    query_rng = np.random.default_rng(config.seed + query_seed_offset)
+    
+    # Sample global indices uniformly from the dataset
+    query_global_indices = query_rng.choice(total_rows, size=nqueries, replace=False)
+    
+    # Convert global indices to (cluster_id, local_index) pairs
+    query_cluster_ids = np.searchsorted(cumsum, query_global_indices, side='right')
+    
+    # Group queries by cluster to generate efficiently
+    cluster_to_query_info = {}
+    for q_idx, (global_idx, cluster_id) in tqdm(enumerate(zip(query_global_indices, query_cluster_ids)), 
+                                                  total=nqueries, desc="Grouping queries by cluster"):
+        local_idx = global_idx if cluster_id == 0 else global_idx - cumsum[cluster_id - 1]
+        if cluster_id not in cluster_to_query_info:
+            cluster_to_query_info[cluster_id] = []
+        cluster_to_query_info[cluster_id].append((q_idx, local_idx))
+    
+    # Generate query points from actual data
+    queries = np.zeros((nqueries, config.ncols), dtype=np.float32)
+    for cluster_id, query_info_list in tqdm(cluster_to_query_info.items(), desc="Generating query points"):
+        n_points = points_per_cluster[cluster_id]
+        
+        if use_gpu_gen:
+            # GPU path: generate on GPU, then copy back
+            cluster_points_gpu = gen_cluster_gpu(cluster_id, n_points, config, return_cupy=True)
+            cluster_points = cp.asnumpy(cluster_points_gpu)
+        else:
+            cluster_points = gen_cluster(cluster_id, n_points, config)
+        
+        for q_idx, local_idx in query_info_list:
+            queries[q_idx] = cluster_points[local_idx]
+    
+    # Add small noise to avoid exact matches
+    noise_scale = np.std(queries) * 0.1
+    queries += query_rng.normal(0, noise_scale, queries.shape).astype(np.float32)
+    
+    return queries
+
+
+def compute_cluster_gt(
+    queries: np.ndarray,
+    total_rows: int,
+    config: ClusterConfig,
+    k: int = 10,
+    nprobes: int = 10,
+    backend: Literal["cuvs", "sklearn"] = "cuvs",
+    metric: str = "sqeuclidean",
+    use_gpu_gen: bool = True
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Compute cluster-based ground truth for given queries.
+    
+    Instead of brute-forcing against all total_rows points,
+    we only generate points from the nprobes nearest clusters.
+    
+    Args:
+        queries: (nqueries, ncols) query vectors
+        total_rows: Total dataset size (for calculating points per cluster)
+        config: Cluster configuration
+        k: Number of nearest neighbors for ground truth
+        nprobes: Number of nearby clusters to search (like IVF)
+        backend: "cuvs" for GPU brute force or "sklearn" for CPU brute force
+        metric: Distance metric
+        use_gpu_gen: If True, use GPU for data generation (faster). Default True.
+    
+    Returns:
+        gt_indices: (nqueries, k) ground truth neighbor indices  
+        gt_distances: (nqueries, k) ground truth distances
+        timing: dict with 'gen_time' and 'bf_time' breakdowns
+    """
+    import time
+    
+    nqueries = len(queries)
+    points_per_cluster = get_num_points_per_cluster(total_rows, config)
+    cumsum = np.cumsum(points_per_cluster)
+
+    # Time: Find nearby clusters for each query
+    find_clusters_start = time.perf_counter()
+    nearby_clusters = find_nearby_clusters(queries, config, nprobes, backend, metric)
+    total_find_clusters_time = time.perf_counter() - find_clusters_start
+
+    # Initialize GT arrays
+    gt_indices = np.full((nqueries, k), -1, dtype=np.int64)
+    gt_distances = np.full((nqueries, k), np.inf, dtype=np.float32)
+    
+    # Track timing
+    total_gen_time = 0.0
+    total_bf_time = 0.0
+    total_merge_time = 0.0
+    
+    # Time: Build reverse mapping
+    mapping_start = time.perf_counter()
+    cluster_to_queries = {}
+    for q_idx in tqdm(range(nqueries), desc="Building reverse mapping"):
+        for cluster_id in nearby_clusters[q_idx]:
+            cluster_id = int(cluster_id)
+            if cluster_id not in cluster_to_queries:
+                cluster_to_queries[cluster_id] = []
+            cluster_to_queries[cluster_id].append(q_idx)
+    total_mapping_time = time.perf_counter() - mapping_start
+    
+    # Process each cluster once
+    for cluster_id in tqdm(cluster_to_queries.keys(), desc="Processing clusters for GT"):
+        query_indices = cluster_to_queries[cluster_id]
+        n_points = points_per_cluster[cluster_id]
+        
+        global_start = 0 if cluster_id == 0 else cumsum[cluster_id - 1]
+        batch_queries = queries[query_indices]
+        
+        if use_gpu_gen and backend == "cuvs":
+            # GPU path: generate on GPU and keep data there
+            gen_start = time.perf_counter()
+            cluster_points_gpu = gen_cluster_gpu(cluster_id, n_points, config, return_cupy=True)
+            total_gen_time += time.perf_counter() - gen_start
+            
+            # Brute force directly on GPU (no CPU->GPU transfer)
+            bf_start = time.perf_counter()
+            k_cluster = min(k, n_points)
+            batch_queries_gpu = cp.asarray(batch_queries)
+            local_indices, local_dists = cuvs_brute_force_knn_gpu(
+                cluster_points_gpu, batch_queries_gpu, k_cluster, metric=metric
+            )
+            total_bf_time += time.perf_counter() - bf_start
+        else:
+            # CPU path: original behavior
+            gen_start = time.perf_counter()
+            cluster_points = gen_cluster(cluster_id, n_points, config)
+            total_gen_time += time.perf_counter() - gen_start
+            
+            bf_start = time.perf_counter()
+            k_cluster = min(k, n_points)
+            local_indices, local_dists = brute_force_knn(
+                cluster_points, batch_queries, k_cluster, backend=backend
+            )
+            total_bf_time += time.perf_counter() - bf_start
+        
+        global_indices = local_indices + global_start
+        
+        # Time: Merge results
+        merge_start = time.perf_counter()
+        for i, q_idx in enumerate(query_indices):
+            merged_indices = np.concatenate([gt_indices[q_idx], global_indices[i]])
+            merged_dists = np.concatenate([gt_distances[q_idx], local_dists[i]])
+            sort_order = np.argsort(merged_dists)[:k]
+            gt_indices[q_idx] = merged_indices[sort_order]
+            gt_distances[q_idx] = merged_dists[sort_order]
+        total_merge_time += time.perf_counter() - merge_start
+
+    timing = {
+        'find_clusters_time': total_find_clusters_time,
+        'mapping_time': total_mapping_time,
+        'gen_time': total_gen_time,
+        'bf_time': total_bf_time,
+        'merge_time': total_merge_time
+    }
+    return gt_indices, gt_distances, timing
+
+
 def gen_gt(
     nqueries: int,
     total_rows: int,
@@ -309,10 +712,7 @@ def gen_gt(
     metric: str = "sqeuclidean"
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Generate queries and compute ground truth
-    
-    Instead of brute-forcing against all total_rows points,
-    we only generate points from the nprobes nearest clusters.
+    Generate queries and compute ground truth (convenience wrapper).
     
     Args:
         nqueries: Number of query points to generate
@@ -328,96 +728,8 @@ def gen_gt(
         gt_indices: (nqueries, k) ground truth neighbor indices  
         gt_distances: (nqueries, k) ground truth distances
     """
-    points_per_cluster = get_num_points_per_cluster(total_rows, config)
-    cumsum = np.cumsum(points_per_cluster)
-    
-    # Generate query points by sampling from actual data points (like compare_pareto.py)
-    query_rng = np.random.default_rng(config.seed + query_seed_offset)
-    
-    # Sample global indices uniformly from the dataset
-    query_global_indices = query_rng.choice(total_rows, size=nqueries, replace=False)
-    
-    # Convert global indices to (cluster_id, local_index) pairs
-    # For each global index, find which cluster it belongs to
-    query_cluster_ids = np.searchsorted(cumsum, query_global_indices, side='right')
-    
-    # Group queries by cluster to generate efficiently
-    cluster_to_query_info = {}  # cluster_id -> list of (query_idx, local_index)
-    for q_idx, (global_idx, cluster_id) in enumerate(zip(query_global_indices, query_cluster_ids)):
-        local_idx = global_idx if cluster_id == 0 else global_idx - cumsum[cluster_id - 1]
-        if cluster_id not in cluster_to_query_info:
-            cluster_to_query_info[cluster_id] = []
-        cluster_to_query_info[cluster_id].append((q_idx, local_idx))
-    
-    # Generate query points from actual data
-    queries = np.zeros((nqueries, config.ncols), dtype=np.float32)
-    for cluster_id, query_info_list in cluster_to_query_info.items():
-        # Generate the full cluster (we need specific indices from it)
-        n_points = points_per_cluster[cluster_id]
-        cluster_points = gen_cluster(cluster_id, n_points, config)
-        
-        # Extract the specific points for queries
-        for q_idx, local_idx in query_info_list:
-            queries[q_idx] = cluster_points[local_idx]
-    
-    # Add small noise to avoid exact matches (like compare_pareto.py)
-    noise_scale = np.std(queries) * 0.1
-    queries += query_rng.normal(0, noise_scale, queries.shape).astype(np.float32)
-
-    # Find nearby clusters for each query
-    nearby_clusters = find_nearby_clusters(queries, config, nprobes, backend, metric)
-
-    # Compute ground truth by iterating over clusters (more efficient)
-    # For each cluster, batch process all queries that have it as a nearby cluster
-    gt_indices = np.full((nqueries, k), -1, dtype=np.int64)
-    gt_distances = np.full((nqueries, k), np.inf, dtype=np.float32)
-    
-    # Build reverse mapping: cluster_id -> list of query indices that need this cluster
-    cluster_to_queries = {}
-    for q_idx in tqdm(range(nqueries), desc="Building reverse mapping"):
-        for cluster_id in nearby_clusters[q_idx]:
-            cluster_id = int(cluster_id)
-            if cluster_id not in cluster_to_queries:
-                cluster_to_queries[cluster_id] = []
-            cluster_to_queries[cluster_id].append(q_idx)
-    
-    # Process each cluster once
-    for cluster_id in tqdm(cluster_to_queries.keys(), desc="Processing clusters for GT"):
-        query_indices = cluster_to_queries[cluster_id]
-        n_points = points_per_cluster[cluster_id]
-        
-        # Generate this cluster's points (only once!)
-        cluster_points = gen_cluster(cluster_id, n_points, config)
-        
-        # Calculate global index offset for this cluster
-        global_start = 0 if cluster_id == 0 else cumsum[cluster_id - 1]
-        
-        # Gather queries that need this cluster
-        batch_queries = queries[query_indices]  # (num_queries_for_cluster, ncols)
-        
-        # Brute force KNN: batch_queries vs cluster_points
-        k_cluster = min(k, n_points)
-        local_indices, local_dists = brute_force_knn(
-            cluster_points,
-            batch_queries,
-            k_cluster,
-            backend=backend
-        )
-        
-        # Convert local indices to global indices
-        global_indices = local_indices + global_start  # (num_queries, k_cluster)
-        
-        # Merge results for each query in this batch
-        for i, q_idx in enumerate(query_indices):
-            # Combine current top-k with new cluster results
-            merged_indices = np.concatenate([gt_indices[q_idx], global_indices[i]])
-            merged_dists = np.concatenate([gt_distances[q_idx], local_dists[i]])
-            
-            # Sort by distance and keep top k
-            sort_order = np.argsort(merged_dists)[:k]
-            gt_indices[q_idx] = merged_indices[sort_order]
-            gt_distances[q_idx] = merged_dists[sort_order]
-
+    queries = gen_queries(nqueries, total_rows, config, query_seed_offset)
+    gt_indices, gt_distances, _ = compute_cluster_gt(queries, total_rows, config, k, nprobes, backend, metric)
     return queries, gt_indices, gt_distances
 
 
@@ -459,9 +771,12 @@ def verify_clustering_gt_accuracy(
         print_config(config)
         print_config(cluster_config)
     
-    # Step 1: Generate ALL data at once
+    # Step 1: Validate configuration (no longer generating all data at once to save memory)
     if verbose:
-        print(f"\n[Step 1] Generating all {config.total_rows:,} vectors for {cluster_config.nclusters} clusters...")
+        print(f"\n[Step 1] Validating configuration for {config.total_rows:,} vectors, {cluster_config.nclusters} clusters...")
+    
+    import time
+    step1_start = time.perf_counter()
     
     points_per_cluster = get_num_points_per_cluster(config.total_rows, cluster_config)
     
@@ -475,48 +790,77 @@ def verify_clustering_gt_accuracy(
             f"Increase total_rows, nprobes, or decrease nclusters/k."
         )
     
-    all_vectors = []
-    for cluster_id in tqdm(range(cluster_config.nclusters)):
-        cluster_points = gen_cluster(cluster_id, points_per_cluster[cluster_id], cluster_config)
-        all_vectors.append(cluster_points)
-    all_data = np.vstack(all_vectors).astype(np.float32)
-    
+    step1_time = time.perf_counter() - step1_start
     if verbose:
-        print(f"  Generated {all_data.shape[0]:,} vectors")
+        print(f"  Cluster sizes: min={min_points}, max={points_per_cluster.max()}, mean={points_per_cluster.mean():.0f}")
+        print(f"  ⏱️  Step 1 time: {step1_time:.2f}s")
     
-    # Step 2: Generate queries and cluster-based GT
+    # Step 2: Generate queries
     if verbose:
-        print(f"\n[Step 2] Generating queries and cluster-based GT (nprobes={config.nprobes})...")
+        print(f"\n[Step 2] Generating {config.nqueries} queries...")
 
-    queries, cluster_gt_indices, cluster_gt_distances = gen_gt(
+    step2_start = time.perf_counter()
+    queries = gen_queries(
         nqueries=config.nqueries,
+        total_rows=config.total_rows,
+        config=cluster_config,
+    )
+    step2_time = time.perf_counter() - step2_start
+
+    if verbose:
+        print(f"  Generated {config.nqueries} queries")
+        print(f"  ⏱️  Step 2 time: {step2_time:.2f}s")
+    
+    # Step 3: Compute cluster-based GT
+    if verbose:
+        print(f"\n[Step 3] Computing cluster-based GT (nprobes={config.nprobes})...")
+
+    step3_start = time.perf_counter()
+    cluster_gt_indices, cluster_gt_distances, step3_timing = compute_cluster_gt(
+        queries=queries,
         total_rows=config.total_rows,
         config=cluster_config,
         k=config.k,
         nprobes=config.nprobes,
         backend=config.gt_backend
     )
+    step3_time = time.perf_counter() - step3_start
 
     if verbose:
-        print(f"  Generated {config.nqueries} queries with cluster-based GT")
+        print(f"  Computed cluster-based GT for {config.nqueries} queries")
+        print(f"  ⏱️  Step 3 time: {step3_time:.2f}s")
+        print(f"      └─ Find nearby clusters: {step3_timing['find_clusters_time']:.2f}s")
+        print(f"      └─ Build mapping:        {step3_timing['mapping_time']:.2f}s")
+        print(f"      └─ Data generation:      {step3_timing['gen_time']:.2f}s")
+        print(f"      └─ Brute force KNN:      {step3_timing['bf_time']:.2f}s")
+        print(f"      └─ Merge results:        {step3_timing['merge_time']:.2f}s")
     
-    # Step 3: Compute TRUE brute force GT on ALL data
+    # Step 4: Compute TRUE brute force GT by streaming through ALL clusters (no OOM!)
     if verbose:
-        print(f"\n[Step 3] Computing TRUE brute force GT on all {config.total_rows:,} vectors...")
+        print(f"\n[Step 4] Computing TRUE brute force GT on all {config.total_rows:,} vectors (streaming)...")
     
-    true_gt_indices, true_gt_distances = brute_force_knn(
-        all_data,
-        queries,
-        config.k,
+    step4_start = time.perf_counter()
+    true_gt_indices, true_gt_distances, step4_timing = compute_true_gt_streaming(
+        queries=queries,
+        cluster_config=cluster_config,
+        total_rows=config.total_rows,
+        k=config.k,
         backend=config.gt_backend
     )
+    step4_time = time.perf_counter() - step4_start
 
     if verbose:
         print(f"  Computed true GT for {config.nqueries} queries")
+        print(f"  ⏱️  Step 4 time: {step4_time:.2f}s")
+        print(f"      └─ Data generation:      {step4_timing['gen_time']:.2f}s")
+        print(f"      └─ Brute force KNN:      {step4_timing['bf_time']:.2f}s")
+        print(f"      └─ Merge results:        {step4_timing['merge_time']:.2f}s")
     
-    # Step 4: Compare cluster-based GT vs true GT
+    # Step 5: Compare cluster-based GT vs true GT
     if verbose:
-        print(f"\n[Step 4] Comparing cluster-based GT vs true brute force GT...")
+        print(f"\n[Step 5] Comparing cluster-based GT vs true brute force GT...")
+    
+    step5_start = time.perf_counter()
     
     # Compute recall with tie-awareness
     gt_accuracy, mismatched_queries = compute_recall_with_ties(
@@ -539,14 +883,33 @@ def verify_clustering_gt_accuracy(
             'overlap': len(cluster_set & true_set) / config.k
         })
     
+    step5_time = time.perf_counter() - step5_start
+    total_time = step1_time + step2_time + step3_time + step4_time + step5_time
+    
     results = {
         'gt_accuracy': gt_accuracy,
         'total_queries': config.nqueries,
         'incorrect_queries': len(incorrect_queries),
         'nprobes_used': config.nprobes,
+        'step1_time': step1_time,
+        'step2_time': step2_time,
+        'step3_time': step3_time,
+        'step3_find_clusters_time': step3_timing['find_clusters_time'],
+        'step3_mapping_time': step3_timing['mapping_time'],
+        'step3_gen_time': step3_timing['gen_time'],
+        'step3_bf_time': step3_timing['bf_time'],
+        'step3_merge_time': step3_timing['merge_time'],
+        'step4_time': step4_time,
+        'step4_gen_time': step4_timing['gen_time'],
+        'step4_bf_time': step4_timing['bf_time'],
+        'step4_merge_time': step4_timing['merge_time'],
+        'step5_time': step5_time,
+        'total_time': total_time,
     }
     
     if verbose:
+        print(f"  ⏱️  Step 5 time: {step5_time:.2f}s")
+        
         print(f"\n" + "=" * 60)
         print("Verification Results")
         print("=" * 60)
@@ -558,6 +921,24 @@ def verify_clustering_gt_accuracy(
             print(f"  Queries with imperfect GT: {len(incorrect_queries)}/{config.nqueries}")
         else:
             print(f"\n  ✨ Perfect GT accuracy! Clustering approach is valid for this config.")
+        
+        print(f"\n" + "-" * 60)
+        print("Timing Summary")
+        print("-" * 60)
+        print(f"  Step 1 (Validate config):    {step1_time:6.2f}s")
+        print(f"  Step 2 (Generate queries):   {step2_time:6.2f}s")
+        print(f"  Step 3 (Cluster-based GT):   {step3_time:6.2f}s")
+        print(f"      └─ Find nearby clusters: {step3_timing['find_clusters_time']:6.2f}s")
+        print(f"      └─ Build mapping:        {step3_timing['mapping_time']:6.2f}s")
+        print(f"      └─ Data generation:      {step3_timing['gen_time']:6.2f}s")
+        print(f"      └─ Brute force KNN:      {step3_timing['bf_time']:6.2f}s")
+        print(f"      └─ Merge results:        {step3_timing['merge_time']:6.2f}s")
+        print(f"  Step 4 (True GT streaming):  {step4_time:6.2f}s")
+        print(f"      └─ Data generation:      {step4_timing['gen_time']:6.2f}s")
+        print(f"      └─ Brute force KNN:      {step4_timing['bf_time']:6.2f}s")
+        print(f"      └─ Merge results:        {step4_timing['merge_time']:6.2f}s")
+        print(f"  Step 5 (Compare):            {step5_time:6.2f}s")
+        print(f"  Total:                       {total_time:6.2f}s")
     
     return results
 
