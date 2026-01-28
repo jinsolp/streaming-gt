@@ -14,17 +14,16 @@ import argparse
 import sys
 import os
 from tqdm import tqdm
-from pylibraft.common import device_ndarray
 import cupy as cp
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from extract_values import load_memmap_bin
-from config import load_cluster_stats
-from config import ClusterConfig
+from config import load_cluster_stats, ClusterConfig
 from utils import brute_force_knn, compute_recall_with_ties
 from scalable_gt import gen_cluster, get_num_points_per_cluster, generate_mock_data, generate_queries_and_gt_batched
+from ann_indices import CagraIndex, IvfPqIndex
 
 
 def analyze_centroid_quality(
@@ -359,8 +358,8 @@ def generate_queries_from_gmm(gmm, n_queries: int) -> np.ndarray:
     return queries.astype(np.float32)
 
 
-def build_cagra_index(data: np.ndarray, graph_degree: int = 128):
-    """Build CAGRA index."""
+def build_cagra_index(data: np.ndarray, graph_degree: int = 128) -> CagraIndex:
+    """Build CAGRA index using CagraIndex wrapper."""
     from cuvs.neighbors import cagra
     
     build_params = cagra.IndexParams(
@@ -371,15 +370,16 @@ def build_cagra_index(data: np.ndarray, graph_degree: int = 128):
     
     print(f"Building CAGRA index (graph_degree={graph_degree})...")
     start = time.perf_counter()
-    index = cagra.build(build_params, data)
+    index = CagraIndex(build_params=build_params)
+    index.build(data)
     build_time = time.perf_counter() - start
     print(f"  Build time: {build_time:.2f}s")
     
     return index
 
 
-def build_ivf_pq_index(data: np.ndarray, n_lists: int = 1024, pq_dim: int = 0):
-    """Build IVF-PQ index."""
+def build_ivf_pq_index(data: np.ndarray, n_lists: int = 1024, pq_dim: int = 0) -> IvfPqIndex:
+    """Build IVF-PQ index using IvfPqIndex wrapper."""
     from cuvs.neighbors import ivf_pq
     
     build_params = ivf_pq.IndexParams(
@@ -390,7 +390,8 @@ def build_ivf_pq_index(data: np.ndarray, n_lists: int = 1024, pq_dim: int = 0):
     
     print(f"Building IVF-PQ index (n_lists={n_lists})...")
     start = time.perf_counter()
-    index = ivf_pq.build(build_params, data)
+    index = IvfPqIndex(build_params=build_params)
+    index.build(data)
     build_time = time.perf_counter() - start
     print(f"  Build time: {build_time:.2f}s")
     
@@ -398,7 +399,7 @@ def build_ivf_pq_index(data: np.ndarray, n_lists: int = 1024, pq_dim: int = 0):
 
 
 def sweep_cagra(
-    index,
+    index: CagraIndex,
     queries: np.ndarray,
     gt_indices: np.ndarray,
     gt_distances: np.ndarray,
@@ -408,31 +409,22 @@ def sweep_cagra(
     """
     Sweep CAGRA search parameters and collect recall/QPS.
     """
-    from cuvs.neighbors import cagra
-    
     results = []
     
     for itopk in itopk_sizes:
-        search_params = cagra.SearchParams(itopk_size=itopk)
-        
-        dev_queries = device_ndarray(queries)
         # warmup
-        _ = cagra.search(search_params, index, dev_queries, k)
+        _ = index.search(queries, k, itopk=itopk)
         
         # Timed search
         n_runs = 3
         times = []
         for _ in tqdm(range(n_runs), desc="Sweeping CAGRA"):
             start = time.perf_counter()
-            distances, neighbors = cagra.search(search_params, index, dev_queries, k)
+            pred_indices, pred_distances = index.search(queries, k, itopk=itopk)
             times.append(time.perf_counter() - start)
         
         avg_time = np.mean(times)
         qps = queries.shape[0] / avg_time
-        
-        # Compute recall with tie-awareness
-        pred_indices = np.asarray(neighbors.copy_to_host())
-        pred_distances = np.asarray(distances.copy_to_host())
        
         recall, _ = compute_recall_with_ties(pred_indices, pred_distances, gt_indices, gt_distances)
         
@@ -448,7 +440,7 @@ def sweep_cagra(
 
 
 def sweep_ivf_pq(
-    index,
+    index: IvfPqIndex,
     queries: np.ndarray,
     gt_indices: np.ndarray,
     gt_distances: np.ndarray,
@@ -458,30 +450,24 @@ def sweep_ivf_pq(
     """
     Sweep IVF-PQ search parameters and collect recall/QPS.
     """
-    from cuvs.neighbors import ivf_pq
-    
     results = []
     
     for n_probes in n_probes_list:
-        search_params = ivf_pq.SearchParams(n_probes=n_probes)
-        
         # Warmup
-        _ = ivf_pq.search(search_params, index, queries[:10], k)
+        _ = index.search(queries[:10], k, n_probes=n_probes)
         
         # Timed search
         n_runs = 3
         times = []
         for _ in range(n_runs):
             start = time.perf_counter()
-            distances, neighbors = ivf_pq.search(search_params, index, queries, k)
+            pred_indices, pred_distances = index.search(queries, k, n_probes=n_probes)
             times.append(time.perf_counter() - start)
         
         avg_time = np.mean(times)
         qps = len(queries) / avg_time
         
         # Compute recall with tie-awareness
-        pred_indices = np.asarray(neighbors)
-        pred_distances = np.asarray(distances)
         recall, _ = compute_recall_with_ties(pred_indices, pred_distances, gt_indices, gt_distances)
         
         results.append({
