@@ -34,17 +34,13 @@ def gen_cluster(cluster_id: int, n_points: int, config: ClusterConfig) -> np.nda
     Generate points for a single cluster deterministically using normal distribution (CPU).
     Same cluster_id + config always produces identical points.
     
-    Supports:
-    - Scalar variance per cluster: config.cluster_variances shape (nclusters,)
-    - Per-dimension variance: config.cluster_variances shape (nclusters, ncols)
+    Uses per-dimension variance: config.cluster_variances shape (nclusters, ncols)
     """
     seed = get_cluster_seed(config.seed, cluster_id)
     rng = np.random.default_rng(seed)
     
     center = config.cluster_centers[cluster_id]
-    variance = config.cluster_variances[cluster_id]
-    
-    # variance can be scalar (single value) or per-dimension array (ncols,)
+    variance = config.cluster_variances[cluster_id]  # (ncols,) per-dimension
     scale = np.sqrt(variance)
     
     # Generate points using normal distribution
@@ -60,9 +56,7 @@ def gen_cluster_gpu(cluster_id: int, n_points: int, config: ClusterConfig, retur
     
     Note: GPU random numbers will differ from CPU version but are deterministic on GPU.
     
-    Supports:
-    - Scalar variance per cluster: config.cluster_variances shape (nclusters,)
-    - Per-dimension variance: config.cluster_variances shape (nclusters, ncols)
+    Uses per-dimension variance: config.cluster_variances shape (nclusters, ncols)
     
     Args:
         cluster_id: ID of the cluster to generate
@@ -80,9 +74,7 @@ def gen_cluster_gpu(cluster_id: int, n_points: int, config: ClusterConfig, retur
     
     # Transfer center and variance to GPU (these are small, can be cached)
     center = cp.asarray(config.cluster_centers[cluster_id])
-    variance = cp.asarray(config.cluster_variances[cluster_id])
-    
-    # variance can be scalar (single value) or per-dimension array (ncols,)
+    variance = cp.asarray(config.cluster_variances[cluster_id])  # (ncols,) per-dimension
     scale = cp.sqrt(variance)
     
     # Generate standard normal samples directly into output array
@@ -126,6 +118,47 @@ def get_num_points_per_cluster(total_points: int, config: ClusterConfig, min_poi
         points_per_cluster[0] += diff
     
     return points_per_cluster
+
+
+def generate_mock_data(
+    cluster_config: ClusterConfig,
+    total_points: int,
+    use_gpu_gen: bool = True,
+) -> np.ndarray:
+    """
+    Generate full mock dataset using cluster configuration.
+    
+    For clusters with near-zero variance, generates just 1 point (the centroid).
+    The remaining points are redistributed to normal clusters proportionally.
+    
+    Args:
+        cluster_config: ClusterConfig with centroids, variances, densities
+        total_points: Total number of points to generate
+        use_gpu_gen: If True, use GPU for data generation (faster). Default False.
+    
+    Returns:
+        Generated data array (total_points, ncols)
+    """
+    # Get points per cluster using existing logic
+    points_per_cluster = get_num_points_per_cluster(total_points, cluster_config)
+
+    # Pre-allocate result array
+    ncols = cluster_config.cluster_centers.shape[1]
+    result = np.empty((total_points, ncols), dtype=np.float32)
+    write_idx = 0
+
+    for cluster_id in tqdm(range(cluster_config.nclusters), desc="Generating mock data"):
+        n_points = points_per_cluster[cluster_id]
+        if n_points <= 0:
+            continue
+        if use_gpu_gen:
+            cluster_points = gen_cluster_gpu(cluster_id, n_points, cluster_config, return_cupy=False)
+        else:
+            cluster_points = gen_cluster(cluster_id, n_points, cluster_config)
+        result[write_idx:write_idx + n_points] = cluster_points
+        write_idx += n_points
+
+    return result
 
 
 def gen_build_sample(
@@ -484,7 +517,7 @@ def generate_queries_and_gt_batched(
         query_indices = rng.choice(n_rows, size=n_queries, replace=False)
         queries = data[query_indices].copy()
         # Add small noise
-        noise_scale = np.std(data[:min(100000, n_rows)]) * 0.1  # Use subset for std to avoid loading all data
+        noise_scale = np.std(data[:min(10000000, n_rows)]) * 0.1  # Use subset for std to avoid loading all data
         queries += rng.normal(0, noise_scale, queries.shape).astype(np.float32)
     
     # Initialize running top-k

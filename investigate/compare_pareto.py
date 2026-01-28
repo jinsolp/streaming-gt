@@ -14,92 +14,22 @@ import argparse
 import sys
 import os
 from tqdm import tqdm
-from pylibraft.common import device_ndarray
 import cupy as cp
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from extract_values import load_memmap_bin, load_cluster_stats
-from config import ClusterConfig
+from extract_values import load_memmap_bin
+from config import load_cluster_stats, ClusterConfig
 from utils import brute_force_knn, compute_recall_with_ties
-from scalable_gt import gen_cluster, get_num_points_per_cluster
-
-
-def generate_mock_data(
-    cluster_config: ClusterConfig,
-    total_points: int,
-) -> np.ndarray:
-    """
-    Generate mock data using cluster configuration.
-    Reuses gen_cluster from scalable_gt for consistency.
-    
-    For clusters with near-zero variance, generates just 1 point (the centroid).
-    The remaining points are redistributed to normal clusters.
-    
-    Args:
-        cluster_config: ClusterConfig with centroids, variances, densities
-        total_points: Total number of points to generate
-    
-    Returns:
-        Generated data array (total_points, ncols)
-    """
-    # Compute variance threshold to identify near-zero variance clusters
-    variances = cluster_config.cluster_variances
-    if variances.ndim == 2:
-        var_per_cluster = variances.mean(axis=1)
-    else:
-        var_per_cluster = variances
-    var_threshold = np.median(var_per_cluster) * 0.01
-    
-    # Identify zero-variance clusters
-    low_var_mask = var_per_cluster < var_threshold
-    n_low_var = low_var_mask.sum()
-    n_normal = cluster_config.nclusters - n_low_var
-    
-    # Calculate points: 1 point per zero-var cluster, rest distributed to normal clusters
-    points_for_low_var = n_low_var  # 1 point each
-    points_for_normal = total_points - points_for_low_var
-    
-    # Get densities for normal clusters only and renormalize
-    normal_densities = cluster_config.cluster_densities[~low_var_mask]
-    if len(normal_densities) > 0:
-        normal_densities = normal_densities / normal_densities.sum()
-    
-    # Distribute points among normal clusters
-    normal_cluster_ids = np.where(~low_var_mask)[0]
-    if n_normal > 0:
-        # Allocate points proportionally
-        base_points = points_for_normal // n_normal
-        extra_points = (normal_densities * (points_for_normal - base_points * n_normal)).astype(np.int64)
-        normal_points_per_cluster = np.full(n_normal, base_points, dtype=np.int64) + extra_points
-        # Fix any rounding errors
-        diff = points_for_normal - normal_points_per_cluster.sum()
-        normal_points_per_cluster[0] += diff
-    
-    all_points = []
-    normal_idx = 0
-    for cluster_id in tqdm(range(cluster_config.nclusters), desc="Generating mock data"):
-        if low_var_mask[cluster_id]:
-            # Zero-variance cluster: just use the centroid
-            centroid = cluster_config.cluster_centers[cluster_id].astype(np.float32)
-            all_points.append(centroid.reshape(1, -1))
-        else:
-            # Normal cluster: use allocated points
-            n_points = normal_points_per_cluster[normal_idx]
-            normal_idx += 1
-            if n_points <= 0:
-                continue
-            cluster_points = gen_cluster(cluster_id, n_points, cluster_config)
-            all_points.append(cluster_points)
-    
-    return np.vstack(all_points).astype(np.float32)
+from scalable_gt import gen_cluster, get_num_points_per_cluster, generate_mock_data, generate_queries_and_gt_batched
+from ann_indices import CagraIndex, IvfPqIndex
 
 
 def analyze_centroid_quality(
     centroids: np.ndarray,
     densities: np.ndarray,
-    variances: np.ndarray,
+    variances_per_dim: np.ndarray,
     means: Optional[np.ndarray] = None
 ) -> Dict:
     """
@@ -113,7 +43,7 @@ def analyze_centroid_quality(
     Args:
         centroids: (n_clusters, n_dim) cluster centers
         densities: (n_clusters,) relative density per cluster
-        variances: (n_clusters,) or (n_clusters, n_dim) variance per cluster
+        variances_per_dim: (n_clusters, n_dim) per-dimension variance per cluster
         means: Optional (n_clusters, n_dim) actual cluster means
     
     Returns:
@@ -222,12 +152,9 @@ def analyze_centroid_quality(
         print(f"    Tiny cluster IDs: {tiny_clusters[:10].tolist()}...")
     
     # === Variance Analysis ===
-    if variances.ndim == 1:
-        var_min, var_max, var_mean = variances.min(), variances.max(), variances.mean()
-    else:
-        # Per-dimension variance: take mean across dimensions
-        var_per_cluster = variances.mean(axis=1)
-        var_min, var_max, var_mean = var_per_cluster.min(), var_per_cluster.max(), var_per_cluster.mean()
+    # Per-dimension variance: take mean across dimensions
+    var_per_cluster = variances_per_dim.mean(axis=1)
+    var_min, var_max, var_mean = var_per_cluster.min(), var_per_cluster.max(), var_per_cluster.mean()
     
     print(f"\n[Variance Distribution]")
     print(f"  Min: {var_min:.6f}, Max: {var_max:.6f}, Mean: {var_mean:.6f}")
@@ -415,47 +342,6 @@ def analyze_data_to_centroid_distances(
     return None
 
 
-def generate_queries_and_gt(
-    data: np.ndarray,
-    n_queries: int,
-    k: int,
-    seed: int = 12345,
-    backend: str = "cuvs",
-    queries: Optional[np.ndarray] = None
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Generate random queries from the data and compute ground truth via brute force.
-    
-    Args:
-        data: Dataset to query
-        n_queries: Number of queries
-        k: Number of nearest neighbors
-        seed: Random seed
-        backend: "cuvs" or "sklearn" for brute force
-        queries: Optional pre-generated queries (if None, samples from data)
-    
-    Returns:
-        queries: (n_queries, ncols)
-        gt_indices: (n_queries, k)
-        gt_distances: (n_queries, k)
-    """
-    if queries is None:
-        rng = np.random.default_rng(seed)
-        
-        # Sample queries from the dataset (with small noise to avoid exact matches)
-        query_indices = rng.choice(len(data), size=n_queries, replace=False)
-        queries = data[query_indices].copy()
-        # Add small noise
-        noise_scale = np.std(data) * 0.1
-        queries += rng.normal(0, noise_scale, queries.shape).astype(np.float32)
-    
-    # Compute ground truth
-    print(f"Computing ground truth for {len(queries)} queries (k={k})...")
-    gt_indices, gt_distances = brute_force_knn(data, queries, k, backend=backend)
-    
-    return queries, gt_indices, gt_distances
-
-
 def generate_queries_from_gmm(gmm, n_queries: int) -> np.ndarray:
     """
     Generate queries by sampling from the GMM.
@@ -472,8 +358,8 @@ def generate_queries_from_gmm(gmm, n_queries: int) -> np.ndarray:
     return queries.astype(np.float32)
 
 
-def build_cagra_index(data: np.ndarray, graph_degree: int = 128):
-    """Build CAGRA index."""
+def build_cagra_index(data: np.ndarray, graph_degree: int = 128) -> CagraIndex:
+    """Build CAGRA index using CagraIndex wrapper."""
     from cuvs.neighbors import cagra
     
     build_params = cagra.IndexParams(
@@ -484,15 +370,16 @@ def build_cagra_index(data: np.ndarray, graph_degree: int = 128):
     
     print(f"Building CAGRA index (graph_degree={graph_degree})...")
     start = time.perf_counter()
-    index = cagra.build(build_params, data)
+    index = CagraIndex(build_params=build_params)
+    index.build(data)
     build_time = time.perf_counter() - start
     print(f"  Build time: {build_time:.2f}s")
     
     return index
 
 
-def build_ivf_pq_index(data: np.ndarray, n_lists: int = 1024, pq_dim: int = 0):
-    """Build IVF-PQ index."""
+def build_ivf_pq_index(data: np.ndarray, n_lists: int = 1024, pq_dim: int = 0) -> IvfPqIndex:
+    """Build IVF-PQ index using IvfPqIndex wrapper."""
     from cuvs.neighbors import ivf_pq
     
     build_params = ivf_pq.IndexParams(
@@ -503,7 +390,8 @@ def build_ivf_pq_index(data: np.ndarray, n_lists: int = 1024, pq_dim: int = 0):
     
     print(f"Building IVF-PQ index (n_lists={n_lists})...")
     start = time.perf_counter()
-    index = ivf_pq.build(build_params, data)
+    index = IvfPqIndex(build_params=build_params)
+    index.build(data)
     build_time = time.perf_counter() - start
     print(f"  Build time: {build_time:.2f}s")
     
@@ -511,7 +399,7 @@ def build_ivf_pq_index(data: np.ndarray, n_lists: int = 1024, pq_dim: int = 0):
 
 
 def sweep_cagra(
-    index,
+    index: CagraIndex,
     queries: np.ndarray,
     gt_indices: np.ndarray,
     gt_distances: np.ndarray,
@@ -521,31 +409,22 @@ def sweep_cagra(
     """
     Sweep CAGRA search parameters and collect recall/QPS.
     """
-    from cuvs.neighbors import cagra
-    
     results = []
     
     for itopk in itopk_sizes:
-        search_params = cagra.SearchParams(itopk_size=itopk)
-        
-        dev_queries = device_ndarray(queries)
         # warmup
-        _ = cagra.search(search_params, index, dev_queries, k)
+        _ = index.search(queries, k, itopk=itopk)
         
         # Timed search
         n_runs = 3
         times = []
         for _ in tqdm(range(n_runs), desc="Sweeping CAGRA"):
             start = time.perf_counter()
-            distances, neighbors = cagra.search(search_params, index, dev_queries, k)
+            pred_indices, pred_distances = index.search(queries, k, itopk=itopk)
             times.append(time.perf_counter() - start)
         
         avg_time = np.mean(times)
         qps = queries.shape[0] / avg_time
-        
-        # Compute recall with tie-awareness
-        pred_indices = np.asarray(neighbors.copy_to_host())
-        pred_distances = np.asarray(distances.copy_to_host())
        
         recall, _ = compute_recall_with_ties(pred_indices, pred_distances, gt_indices, gt_distances)
         
@@ -561,7 +440,7 @@ def sweep_cagra(
 
 
 def sweep_ivf_pq(
-    index,
+    index: IvfPqIndex,
     queries: np.ndarray,
     gt_indices: np.ndarray,
     gt_distances: np.ndarray,
@@ -571,30 +450,24 @@ def sweep_ivf_pq(
     """
     Sweep IVF-PQ search parameters and collect recall/QPS.
     """
-    from cuvs.neighbors import ivf_pq
-    
     results = []
     
     for n_probes in n_probes_list:
-        search_params = ivf_pq.SearchParams(n_probes=n_probes)
-        
         # Warmup
-        _ = ivf_pq.search(search_params, index, queries[:10], k)
+        _ = index.search(queries[:10], k, n_probes=n_probes)
         
         # Timed search
         n_runs = 3
         times = []
         for _ in range(n_runs):
             start = time.perf_counter()
-            distances, neighbors = ivf_pq.search(search_params, index, queries, k)
+            pred_indices, pred_distances = index.search(queries, k, n_probes=n_probes)
             times.append(time.perf_counter() - start)
         
         avg_time = np.mean(times)
         qps = len(queries) / avg_time
         
         # Compute recall with tie-awareness
-        pred_indices = np.asarray(neighbors)
-        pred_distances = np.asarray(distances)
         recall, _ = compute_recall_with_ties(pred_indices, pred_distances, gt_indices, gt_distances)
         
         results.append({
@@ -696,13 +569,13 @@ def compare_datasets(
     
     # Generate queries and GT for original (always brute force since no cluster structure)
     print("\n[Original Dataset]")
-    orig_queries, orig_gt_idx, orig_gt_dist = generate_queries_and_gt(
+    orig_queries, orig_gt_idx, orig_gt_dist = generate_queries_and_gt_batched(
         original_data, n_queries, k, seed=12345, backend=backend
     )
     
     # Generate queries and GT for mock (use brute force for fair comparison)
     print("\n[Mock Dataset]")
-    mock_queries, mock_gt_idx, mock_gt_dist = generate_queries_and_gt(
+    mock_queries, mock_gt_idx, mock_gt_dist = generate_queries_and_gt_batched(
         mock_data, n_queries, k, seed=12345, backend=backend, queries=gmm_queries
     )
     
@@ -880,21 +753,13 @@ if __name__ == "__main__":
         stats = load_cluster_stats(args.cluster_stats)
         centroids = stats['centroids']
         densities = stats['densities']
-        # Use per-dimension variances if available, else scalar variances
-        variances = stats['variances_per_dim'] if stats['variances_per_dim'] is not None else stats['variances']
-        # Optional: min/max bounds
-        mins = stats['mins_per_dim']
-        maxs = stats['maxs_per_dim']
+        variances_per_dim = stats['variances_per_dim']
         
         # Save original cluster count for title/filename
         original_n_clusters = len(centroids)
         
         # Identify problematic clusters (near-zero variance)
-        if variances.ndim == 2:
-            var_per_cluster = variances.mean(axis=1)
-        else:
-            var_per_cluster = variances
-        
+        var_per_cluster = variances_per_dim.mean(axis=1)
         var_threshold = np.median(var_per_cluster) * 0.01
         low_var_mask = var_per_cluster < var_threshold
         n_low_var = low_var_mask.sum()
@@ -911,10 +776,8 @@ if __name__ == "__main__":
             ncols=n_dim,
             seed=42,
             cluster_centers=centroids,
-            cluster_variances=variances,
+            cluster_variances=variances_per_dim,
             cluster_densities=densities,
-            cluster_mins=mins,
-            cluster_maxs=maxs,
         )
         
         # Generate mock data

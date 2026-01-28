@@ -132,16 +132,30 @@ class IvfPqIndex:
         else:
             self.extend(dataset)
     
-    def search(self, queries: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Search the index for k nearest neighbors."""
+    def search(self, queries: np.ndarray, k: int, n_probes: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Search the index for k nearest neighbors.
+        
+        Args:
+            queries: Query vectors
+            k: Number of nearest neighbors to return
+            n_probes: Number of clusters to probe (larger = better recall, slower)
+                      If None, uses the value from search_params
+        """
         queries_device = device_ndarray(queries.astype(np.float32))
         out_idx = np.zeros((queries.shape[0], k), dtype=np.int64)
         out_dist = np.zeros((queries.shape[0], k), dtype=np.float32)
         out_idx_device = device_ndarray(out_idx)
         out_dist_device = device_ndarray(out_dist)
         
+        # Use custom n_probes if provided, otherwise use default search_params
+        if n_probes is not None:
+            search_params = ivf_pq.SearchParams(n_probes=n_probes)
+        else:
+            search_params = self.search_params
+        
         ivf_pq.search(
-            self.search_params,
+            search_params,
             self.index,
             queries_device,
             k,

@@ -21,22 +21,25 @@ class ClusterConfig:
     
     Parameters:
         cluster_centers: (nclusters, ncols) cluster centroids (required)
-        cluster_variances: (nclusters,) or (nclusters, ncols) variance per cluster (required)
+        cluster_variances: (nclusters, ncols) per-dimension variance per cluster (required)
         cluster_densities: (nclusters,) relative density per cluster (required)
-        cluster_mins: Optional (nclusters, ncols) - per-dimension min bounds
-        cluster_maxs: Optional (nclusters, ncols) - per-dimension max bounds
-        cluster_means: Optional (nclusters, ncols) - actual means of clusters (for diagnostics)
+    
+        # Low-rank covariance parameters (for better capturing correlations)
+        pca_components_list: Optional list of (k, ncols) arrays - principal directions per cluster
+        pca_explained_var_list: Optional list of (k,) arrays - variance along each PC per cluster
+        pca_noise_var: Optional (nclusters,) residual noise variance per cluster
     """
     nclusters: int
     ncols: int  # dimensions
     seed: int
     cluster_centers: np.ndarray  # (nclusters, ncols) - required
-    cluster_variances: np.ndarray  # (nclusters,) or (nclusters, ncols) - required
+    cluster_variances: np.ndarray  # (nclusters, ncols) per-dim variance - required
     cluster_densities: np.ndarray  # (nclusters,) - required
-    # Optional: extracted from real data for more realistic generation
-    cluster_means: Optional[np.ndarray] = None  # (nclusters, ncols), actual cluster means
-    cluster_mins: Optional[np.ndarray] = None  # (nclusters, ncols), per-dim min bounds
-    cluster_maxs: Optional[np.ndarray] = None  # (nclusters, ncols), per-dim max bounds
+
+    # Low-rank covariance (captures correlations between dimensions)
+    pca_components_list: Optional[list] = None  # list of (k, ncols) or None per cluster
+    pca_explained_var_list: Optional[list] = None  # list of (k,) or None per cluster
+    pca_noise_var: Optional[np.ndarray] = None  # (nclusters,) residual noise variance
     
     def __post_init__(self):
         # Normalize densities to sum to 1
@@ -65,26 +68,39 @@ class BenchmarkConfig:
     ann_index: Any = None  # type: Union[CagraIndex, IvfPqIndex]
 
 
+def save_cluster_stats(filepath: str, stats: dict):
+    """
+    Save cluster statistics to a .npz file.
+    
+    Args:
+        filepath: Output path for .npz file
+        stats: Dict from extract_cluster_stats containing:
+            - centroids, densities (required)
+            - variances_per_dim (per-dimension variance)
+    """
+    np.savez(
+        filepath,
+        centroids=stats['centroids'],
+        densities=stats['densities'],
+        variances_per_dim=stats['variances_per_dim'],
+    )
+    print(f"Saved cluster statistics to {filepath}")
+
+
 def load_cluster_stats(filepath: str) -> dict:
     """
     Load cluster statistics from a .npz file.
     
     Returns dict with:
-        - centroids, variances, densities: Always present
-        - variances_per_dim, mins_per_dim, maxs_per_dim, means_per_dim: 
-          Present if saved with new format, None otherwise
+        - centroids, densities: Always present
+        - variances_per_dim: Per-dimension variance (n_clusters, n_dim)
     """
     data = np.load(filepath)
     
     result = {
         'centroids': data['centroids'],
-        'variances': data['variances'],
         'densities': data['densities'],
-        # New fields - None if not present (backward compat)
-        'variances_per_dim': data['variances_per_dim'] if 'variances_per_dim' in data else None,
-        'mins_per_dim': data['mins_per_dim'] if 'mins_per_dim' in data else None,
-        'maxs_per_dim': data['maxs_per_dim'] if 'maxs_per_dim' in data else None,
-        'means_per_dim': data['means_per_dim'] if 'means_per_dim' in data else None,
+        'variances_per_dim': data['variances_per_dim'],
     }
     
     return result
@@ -94,7 +110,7 @@ def get_cluster_config(config: BenchmarkConfig) -> ClusterConfig:
     """
     Create ClusterConfig from BenchmarkConfig by loading pre-extracted cluster stats.
     
-    cluster_stats_path must be provided - this loads centroids, variances, densities
+    cluster_stats_path must be provided - this loads centroids, variances_per_dim, densities
     from a .npz file created by extract_values.py.
     """
     if config.cluster_stats_path is None:
@@ -105,11 +121,7 @@ def get_cluster_config(config: BenchmarkConfig) -> ClusterConfig:
     
     centroids = stats['centroids']
     densities = stats['densities']
-    # Use per-dimension variances if available, else scalar variances
-    variances = stats['variances_per_dim'] if stats['variances_per_dim'] is not None else stats['variances']
-    mins = stats['mins_per_dim']
-    maxs = stats['maxs_per_dim']
-    means = stats['means_per_dim']
+    variances_per_dim = stats['variances_per_dim']
     
     n_clusters = len(centroids)
     n_cols = centroids.shape[1]
@@ -121,9 +133,6 @@ def get_cluster_config(config: BenchmarkConfig) -> ClusterConfig:
         ncols=n_cols,
         seed=config.seed,
         cluster_centers=centroids,
-        cluster_variances=variances,
+        cluster_variances=variances_per_dim,
         cluster_densities=densities,
-        cluster_mins=mins,
-        cluster_maxs=maxs,
-        cluster_means=means,
     )

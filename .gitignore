@@ -1,6 +1,7 @@
 *.png
 __pycache__/
 *.npz
+*.npy
 *bin
 *joblib
 *.log
