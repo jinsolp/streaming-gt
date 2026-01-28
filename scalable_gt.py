@@ -7,9 +7,11 @@ Key idea: Generate clustered data deterministically so we can:
 """
 
 import numpy as np
+import cupy as cp
 from typing import Tuple, List, Literal
 from tqdm import tqdm
 from cuvs.neighbors import cagra
+import time
 
 from config import ClusterConfig, BenchmarkConfig, get_cluster_config
 from ann_indices import CagraIndex, IvfPqIndex
@@ -28,66 +30,342 @@ def get_cluster_seed(base_seed: int, cluster_id: int) -> int:
     return base_seed * 1000000 + cluster_id
 
 
+def _sample_standard(rng, shape, dtype, student_df=None):
+    """
+    Sample from standard normal or Student's t distribution.
+    
+    When student_df is set, uses Student's t with that many degrees of freedom,
+    scaled to have unit variance (like standard normal).
+    
+    Lower df = heavier tails = more extreme points:
+    - df=None or inf: Standard normal
+    - df=5: Moderately heavy tails
+    - df=3: Very heavy tails
+    """
+    if student_df is None or student_df > 100:
+        return rng.standard_normal(shape, dtype=dtype)
+    else:
+        # Student's t = Z / sqrt(V/df) where Z ~ N(0,1), V ~ chi-squared(df)
+        # CuPy Generator doesn't have standard_t, so we construct it
+        z = rng.standard_normal(shape, dtype=dtype)
+        # Use one chi-squared per row (shared across dimensions for correlation)
+        n_samples = shape[0] if len(shape) > 1 else shape[0]
+        chi2 = rng.chisquare(student_df, (n_samples, 1)).astype(dtype)
+        t_samples = z / cp.sqrt(chi2 / student_df)
+        
+        # Student's t has variance = df/(df-2) for df > 2
+        # Scale to unit variance by multiplying by sqrt((df-2)/df)
+        if student_df > 2:
+            scale_to_unit_var = cp.sqrt((student_df - 2) / student_df)
+            t_samples = t_samples * scale_to_unit_var
+        return t_samples
+
+
 def gen_cluster(cluster_id: int, n_points: int, config: ClusterConfig) -> np.ndarray:
     """
-    Generate points for a single cluster deterministically using normal distribution.
+    Generate points for a single cluster deterministically using GPU (CuPy).
     Same cluster_id + config always produces identical points.
     
     Supports:
     - Scalar variance per cluster: config.cluster_variances shape (nclusters,)
     - Per-dimension variance: config.cluster_variances shape (nclusters, ncols)
+    - Low-rank covariance: if config.pca_components_list is provided, uses PCA-based sampling
+    - Heavy-tailed distribution: if config.student_df is set, uses Student's t instead of Gaussian
+    
+    For low-variance clusters (n_points=1), returns the centroid directly.
+    
+    Args:
+        cluster_id: Which cluster to generate
+        n_points: Number of points to generate
+        config: Cluster configuration
+    
+    Returns:
+        numpy array of shape (n_points, ncols)
     """
-    seed = get_cluster_seed(config.seed, cluster_id)
-    rng = np.random.default_rng(seed)
-    
     center = config.cluster_centers[cluster_id]
-    variance = config.cluster_variances[cluster_id]
     
-    # variance can be scalar (single value) or per-dimension array (ncols,)
-    scale = np.sqrt(variance)
+    # For low-variance clusters with 1 point, just return the centroid
+    if n_points == 1:
+        return center.reshape(1, -1).astype(np.float32)
     
-    # Generate points using normal distribution
-    points = rng.normal(loc=center, scale=scale, size=(n_points, config.ncols))
+    seed = get_cluster_seed(config.seed, cluster_id)
+    rng = cp.random.default_rng(seed)
     
-    return points.astype(np.float32)
+    # Check if low-rank covariance is available for this cluster
+    if config.is_lowrank and config.pca_components_list[cluster_id] is not None:
+        # Low-rank sampling: sample in PCA space, project back
+        pca_components = cp.asarray(config.pca_components_list[cluster_id])  # (k, ncols)
+        explained_var = cp.asarray(config.pca_explained_var_list[cluster_id])  # (k,)
+        noise_var = float(config.pca_noise_var[cluster_id])
+        center_gpu = cp.asarray(center)
+        
+        k = len(explained_var)
+        
+        # Sample in PCA space: z ~ N(0, explained_var * pca_scale) or Student's t
+        # pca_scale < 1 reduces structure, making data harder to search
+        raw_scaled_var = explained_var * config.pca_scale
+        scaled_var = cp.maximum(raw_scaled_var, 0.0)
+        z = _sample_standard(rng, (n_points, k), cp.float32, config.student_df) * cp.sqrt(scaled_var)
+        
+        # Project back to original space: z @ components
+        projected = z @ pca_components  # (n_points, k) @ (k, ncols) = (n_points, ncols)
+        
+        # Add isotropic noise for unexplained variance (also heavy-tailed if specified)
+        noise_std = float(cp.sqrt(max(noise_var, 0.0)))
+        noise = _sample_standard(rng, (n_points, config.ncols), cp.float32, config.student_df) * noise_std
+        
+        # Combine projected + noise (centered points before adding center)
+        centered_points = projected + noise
+        
+        # First: Scale to match original cluster variance (affects directions via stretching)
+        actual_var_before = float(cp.var(centered_points))
+        
+        if config.cluster_variances.ndim == 2:
+            # Per-dimension scaling for more accurate variance matching
+            target_var_per_dim = cp.asarray(config.cluster_variances[cluster_id])  # (ncols,)
+            actual_var_per_dim = cp.var(centered_points, axis=0)  # (ncols,)
+            # Scale each dimension separately (avoid div by zero)
+            scale_factors = cp.sqrt(target_var_per_dim / cp.maximum(actual_var_per_dim, 1e-10))
+            centered_points = centered_points * scale_factors  # broadcasts (n_points, ncols) * (ncols,)
+        else:
+            # Scalar variance: single scale factor for all dimensions
+            target_var = float(config.cluster_variances[cluster_id])
+            if actual_var_before > 0 and target_var > 0:
+                scale_factor = float(cp.sqrt(target_var / actual_var_before))
+                centered_points = centered_points * scale_factor
+        
+        # Final points: center + scaled centered_points
+        points = center_gpu + centered_points
+    else:
+        # Diagonal covariance fallback
+        center_gpu = cp.asarray(center)
+        
+        # First: Generate points with correct per-dimension variance scaling
+        # This affects the "directions" (relative contribution of each dimension)
+        variance = config.cluster_variances[cluster_id]
+        scale = cp.sqrt(cp.asarray(variance))
+        centered_points = _sample_standard(rng, (n_points, config.ncols), cp.float32, config.student_df) * scale
+        
+        points = center_gpu + centered_points
+    
+    # Return as numpy array
+    return cp.asnumpy(points).astype(np.float32)
 
 
-def get_num_points_per_cluster(total_points: int, config: ClusterConfig, min_points_per_cluster: int = 1) -> np.ndarray:
+def get_low_variance_mask(config: ClusterConfig) -> np.ndarray:
+    """
+    Identify clusters with near-zero variance.
+    These clusters should only generate 1 point (the centroid).
+    
+    Returns:
+        Boolean mask of shape (nclusters,) - True for low-variance clusters
+    """
+    variances = config.cluster_variances
+    if variances.ndim == 2:
+        # Per-dimension variance: use mean across dimensions
+        var_per_cluster = variances.mean(axis=1)
+    else:
+        var_per_cluster = variances
+    
+    var_threshold = np.median(var_per_cluster) * 0.01
+    return var_per_cluster < var_threshold
+
+
+def get_num_points_per_cluster(total_points: int, config: ClusterConfig) -> np.ndarray:
     """
     Calculate how many points each cluster should have based on densities.
-    Ensures each cluster gets at least min_points_per_cluster points.
+    
+    Low-variance clusters (variance < median * 0.01) get exactly 1 point (centroid).
+    Remaining points are distributed to normal clusters proportionally.
     """
     nclusters = config.nclusters
     
-    # Check if we have enough total points
-    min_required = nclusters * min_points_per_cluster
-    if total_points < min_required:
-        raise ValueError(
-            f"total_points={total_points} is less than nclusters * min_points_per_cluster = {min_required}. "
-            f"Increase total_points or decrease nclusters."
-        )
+    # Identify low-variance clusters
+    low_var_mask = get_low_variance_mask(config)
+    n_low_var = low_var_mask.sum()
+    n_normal = nclusters - n_low_var
     
-    # First, give each cluster the minimum
-    points_per_cluster = np.full(nclusters, min_points_per_cluster, dtype=np.int64)
+    # Initialize: low-var clusters get 1 point each
+    points_per_cluster = np.ones(nclusters, dtype=np.int64)
     
-    # Distribute remaining points proportionally based on densities
-    remaining = total_points - min_required
-    if remaining > 0:
-        extra_points = (config.cluster_densities * remaining).astype(np.int64)
-        points_per_cluster += extra_points
-        
-        # Add remainder to first cluster
-        diff = total_points - points_per_cluster.sum()
-        points_per_cluster[0] += diff
+    if n_normal == 0:
+        # All clusters are low-variance, just return 1 per cluster
+        # (this shouldn't happen in practice)
+        return points_per_cluster
+    
+    # Remaining points go to normal clusters
+    points_for_normal = total_points - n_low_var
+    
+    # Get densities for normal clusters only and renormalize
+    normal_cluster_ids = np.where(~low_var_mask)[0]
+    normal_densities = config.cluster_densities[~low_var_mask]
+    normal_densities = normal_densities / normal_densities.sum()
+    
+    # Allocate points proportionally (matches generate_mock_data logic)
+    base_points = points_for_normal // n_normal
+    extra_points = (normal_densities * (points_for_normal - base_points * n_normal)).astype(np.int64)
+    normal_points_per_cluster = np.full(n_normal, base_points, dtype=np.int64) + extra_points
+    
+    # Fix any rounding errors
+    diff = points_for_normal - normal_points_per_cluster.sum()
+    normal_points_per_cluster[0] += diff
+    
+    # Assign to the result array
+    for i, cid in enumerate(normal_cluster_ids):
+        points_per_cluster[cid] = normal_points_per_cluster[i]
     
     return points_per_cluster
+
+
+def generate_mock_data(
+    cluster_config: ClusterConfig,
+    total_points: int,
+) -> np.ndarray:
+    """
+    Generate full mock dataset using cluster configuration (GPU-accelerated).
+    
+    For clusters with near-zero variance, generates just 1 point (the centroid).
+    The remaining points are redistributed to normal clusters proportionally.
+    
+    Optionally injects outliers (points scattered outside cluster structure) to
+    make the data harder for ANN algorithms.
+    
+    Args:
+        cluster_config: ClusterConfig with centroids, variances, densities
+        total_points: Total number of points to generate
+    
+    Returns:
+        Generated data array (total_points, ncols)
+    """
+    # Get points per cluster using existing logic
+    points_per_cluster = get_num_points_per_cluster(total_points, cluster_config)
+    
+    # Pre-allocate result array
+    ncols = cluster_config.cluster_centers.shape[1]
+    result = np.empty((total_points, ncols), dtype=np.float32)
+    write_idx = 0
+    
+    for cluster_id in tqdm(range(cluster_config.nclusters), desc="Generating mock data"):
+        n_points = points_per_cluster[cluster_id]
+        if n_points <= 0:
+            continue
+        cluster_points = gen_cluster(cluster_id, n_points, cluster_config)
+        result[write_idx:write_idx + n_points] = cluster_points
+        write_idx += n_points
+    
+    # Inject outliers if specified
+    if cluster_config.outlier_fraction > 0:
+        n_outliers = int(total_points * cluster_config.outlier_fraction)
+        if n_outliers > 0:
+            rng = np.random.default_rng(cluster_config.seed + 999)  # Different seed for outliers
+            
+            # Compute data bounds from cluster centers + variance spread
+            centers = cluster_config.cluster_centers
+            # Use wider bounds: min/max of centers ± 3*std (covers ~99.7% of normal data)
+            if cluster_config.cluster_variances.ndim == 2:
+                stds = np.sqrt(cluster_config.cluster_variances.mean(axis=0))  # (ncols,)
+            else:
+                stds = np.sqrt(cluster_config.cluster_variances.mean()) * np.ones(ncols)
+            
+            data_min = centers.min(axis=0) - 3 * stds
+            data_max = centers.max(axis=0) + 3 * stds
+            
+            # Generate uniformly distributed outliers
+            outliers = rng.uniform(data_min, data_max, (n_outliers, ncols)).astype(np.float32)
+            
+            # Randomly select indices to replace
+            outlier_indices = rng.choice(total_points, n_outliers, replace=False)
+            result[outlier_indices] = outliers
+            
+            print(f"  Injected {n_outliers} outliers ({cluster_config.outlier_fraction*100:.1f}% of data)")
+    
+    return result
+
+
+def gen_gt_brute_force(
+    data: np.ndarray,
+    n_queries: int,
+    k: int,
+    seed: int = 12345,
+    backend: str = "cuvs",
+    queries: np.ndarray = None,
+    batch_size: int = 0
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate random queries from the data and compute ground truth via brute force.
+    
+    For large datasets, use batch_size > 0 to process data in batches and 
+    merge results incrementally to avoid OOM.
+    
+    Args:
+        data: Dataset to query
+        n_queries: Number of queries
+        k: Number of nearest neighbors
+        seed: Random seed
+        backend: "cuvs" or "sklearn" for brute force
+        queries: Optional pre-generated queries (if None, samples from data)
+        batch_size: If > 0, process data in batches of this size
+    
+    Returns:
+        queries: (n_queries, ncols)
+        gt_indices: (n_queries, k)
+        gt_distances: (n_queries, k)
+    """
+    n_rows = len(data)
+    
+    if queries is None:
+        rng = np.random.default_rng(seed)
+        
+        # Sample queries from the dataset (with small noise to avoid exact matches)
+        query_indices = rng.choice(n_rows, size=n_queries, replace=False)
+        queries = data[query_indices].copy()
+        # Add small noise (use subset for std to avoid loading all data for large datasets)
+        noise_scale = np.std(data[:min(100000, n_rows)]) * 0.1
+        queries += rng.normal(0, noise_scale, queries.shape).astype(np.float32)
+    
+    # Non-batched: single brute force call
+    if batch_size <= 0 or batch_size >= n_rows:
+        print(f"Computing ground truth for {len(queries)} queries (k={k})...")
+        gt_indices, gt_distances = brute_force_knn(data, queries, k, backend=backend)
+        return queries, gt_indices, gt_distances
+    
+    # Batched: process in chunks and merge
+    gt_indices = np.full((n_queries, k), -1, dtype=np.int64)
+    gt_distances = np.full((n_queries, k), np.inf, dtype=np.float32)
+    
+    num_batches = (n_rows + batch_size - 1) // batch_size
+    print(f"Computing batched GT for {n_queries} queries over {n_rows:,} vectors ({num_batches} batches)...")
+    
+    for batch_num in tqdm(range(num_batches), desc="GT batches"):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, n_rows)
+        batch_data = data[start_idx:end_idx]
+        
+        # Compute brute force KNN for this batch
+        batch_indices, batch_distances = brute_force_knn(batch_data, queries, k, backend=backend)
+        
+        # Convert local batch indices to global indices
+        batch_indices = batch_indices + start_idx
+        
+        # Merge with running top-k
+        for q_idx in range(n_queries):
+            # Concatenate current top-k with batch results
+            merged_indices = np.concatenate([gt_indices[q_idx], batch_indices[q_idx]])
+            merged_distances = np.concatenate([gt_distances[q_idx], batch_distances[q_idx]])
+            
+            # Sort by distance and keep top k
+            sort_order = np.argsort(merged_distances)[:k]
+            gt_indices[q_idx] = merged_indices[sort_order]
+            gt_distances[q_idx] = merged_distances[sort_order]
+    
+    return queries, gt_indices, gt_distances
 
 
 def gen_build_sample(
     sample_size: int,
     total_rows: int,
     config: ClusterConfig
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate a build sample that includes vectors from ALL clusters proportionally.
     
@@ -101,10 +379,12 @@ def gen_build_sample(
     
     Returns:
         vectors: (sample_size, ncols) array of vectors
+        global_indices: (sample_size,) array of global indices for each vector
         cluster_ids: (sample_size,) array of cluster assignments
         n_sampled_per_cluster: (nclusters,) how many vectors sampled from each cluster
     """
     points_per_cluster = get_num_points_per_cluster(total_rows, config)
+    cumsum = np.cumsum(points_per_cluster)
     
     # Calculate how many to sample from each cluster
     # Sample proportionally based on cluster sizes, with minimum 1 per cluster if possible
@@ -126,9 +406,10 @@ def gen_build_sample(
     
     # Generate sampled vectors from each cluster (take first N from each)
     vectors = []
+    global_indices = []
     cluster_ids = []
     
-    for cluster_id in range(config.nclusters):
+    for cluster_id in tqdm(range(config.nclusters), desc="Getting samples from clusters"):
         n_sample = n_sampled_per_cluster[cluster_id]
         if n_sample > 0:
             # Generate full cluster and take first n_sample vectors
@@ -136,11 +417,16 @@ def gen_build_sample(
             cluster_points = gen_cluster(cluster_id, n_cluster_points, config)
             vectors.append(cluster_points[:n_sample])
             cluster_ids.append(np.full(n_sample, cluster_id, dtype=np.int32))
+            
+            # Compute global indices for these vectors
+            global_start = 0 if cluster_id == 0 else cumsum[cluster_id - 1]
+            global_indices.append(np.arange(global_start, global_start + n_sample, dtype=np.int64))
     
     vectors = np.vstack(vectors).astype(np.float32)
+    global_indices = np.concatenate(global_indices)
     cluster_ids = np.concatenate(cluster_ids)
     
-    return vectors, cluster_ids, n_sampled_per_cluster
+    return vectors, global_indices, cluster_ids, n_sampled_per_cluster
 
 
 def gen_extend_batch(
@@ -148,72 +434,93 @@ def gen_extend_batch(
     batch_size: int,
     total_rows: int,
     config: ClusterConfig,
-    n_sampled_per_cluster: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
+    n_already_sampled_per_cluster: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Generate a batch of vectors for extend, skipping vectors already used in build.
+    Generate a batch of vectors for extend, DISTRIBUTED across all clusters.
+    
+    Unlike sequential batching, this samples proportionally from all clusters
+    to ensure each extend batch has vectors spread across the data distribution.
+    This helps CAGRA maintain better graph connectivity.
     
     Args:
         batch_num: Batch number (0-indexed, for the extend phase)
         batch_size: Number of vectors per batch
         total_rows: Total dataset size
         config: Cluster configuration
-        n_sampled_per_cluster: How many vectors were sampled from each cluster for build
+        n_already_sampled_per_cluster: How many vectors have ALREADY been sampled 
+                                        from each cluster (cumulative from build + previous extends)
     
     Returns:
         vectors: (batch_size, ncols) array of vectors
+        global_indices: (batch_size,) array of global indices for each vector
         cluster_ids: (batch_size,) array of cluster assignments
     """
     points_per_cluster = get_num_points_per_cluster(total_rows, config)
-    remaining_per_cluster = points_per_cluster - n_sampled_per_cluster
+    cumsum = np.cumsum(points_per_cluster)
+    remaining_per_cluster = points_per_cluster - n_already_sampled_per_cluster
     
-    # Calculate cumulative sum for remaining vectors
-    cumsum_remaining = np.cumsum(remaining_per_cluster)
-    total_remaining = cumsum_remaining[-1]
+    total_remaining = remaining_per_cluster.sum()
+    if total_remaining <= 0:
+        return np.array([]).reshape(0, config.ncols), np.array([], dtype=np.int64), np.array([])
     
-    start_idx = batch_num * batch_size
-    end_idx = min(start_idx + batch_size, total_remaining)
-    actual_batch_size = end_idx - start_idx
-    if actual_batch_size <= 0:
-        return np.array([]).reshape(0, config.ncols), np.array([])
+    # Calculate how many to sample from each cluster for THIS batch
+    # Sample proportionally based on remaining capacity
+    actual_batch_size = min(batch_size, total_remaining)
     
+    # Distribute batch_size proportionally across clusters based on remaining vectors
+    remaining_fractions = remaining_per_cluster / total_remaining
+    n_to_sample = (remaining_fractions * actual_batch_size).astype(np.int64)
+    
+    # Ensure we don't exceed remaining capacity
+    n_to_sample = np.minimum(n_to_sample, remaining_per_cluster)
+    
+    # Distribute any leftover due to rounding
+    leftover = actual_batch_size - n_to_sample.sum()
+    for cluster_id in range(config.nclusters):
+        if leftover <= 0:
+            break
+        capacity = remaining_per_cluster[cluster_id] - n_to_sample[cluster_id]
+        add = min(leftover, capacity)
+        n_to_sample[cluster_id] += add
+        leftover -= add
+    
+    # Generate sampled vectors from each cluster
     vectors = []
+    global_indices = []
     cluster_ids = []
     
-    for cluster_id in range(config.nclusters):
-        cluster_start = 0 if cluster_id == 0 else cumsum_remaining[cluster_id - 1]
-        cluster_end = cumsum_remaining[cluster_id]
-        
-        if cluster_start >= end_idx:
-            break
-        if cluster_end <= start_idx:
+    for cluster_id in tqdm(range(config.nclusters), desc="Generating vectors from clusters"):
+        n_sample = n_to_sample[cluster_id]
+        if n_sample <= 0:
             continue
         
-        # This cluster overlaps with batch range
-        overlap_start = max(start_idx, cluster_start)
-        overlap_end = min(end_idx, cluster_end)
-        
-        # Generate full cluster, then slice the portion we need
-        # Skip the first n_sampled vectors (already used in build)
+        # Generate full cluster
         n_cluster_points = points_per_cluster[cluster_id]
         cluster_points = gen_cluster(cluster_id, n_cluster_points, config)
         
-        # Local indices within the REMAINING portion of this cluster
-        local_start = overlap_start - cluster_start
-        local_end = overlap_end - cluster_start
+        # Take vectors starting from where we left off (after already sampled)
+        offset = n_already_sampled_per_cluster[cluster_id]
+        vectors.append(cluster_points[offset:offset + n_sample])
+        cluster_ids.append(np.full(n_sample, cluster_id, dtype=np.int32))
         
-        # Offset by n_sampled to skip build vectors
-        offset = n_sampled_per_cluster[cluster_id]
-        vectors.append(cluster_points[offset + local_start:offset + local_end])
-        cluster_ids.append(np.full(local_end - local_start, cluster_id, dtype=np.int32))
+        # Compute global indices for these vectors
+        global_base = 0 if cluster_id == 0 else cumsum[cluster_id - 1]
+        global_indices.append(np.arange(
+            global_base + offset,
+            global_base + offset + n_sample,
+            dtype=np.int64
+        ))
     
     if len(vectors) == 0:
-        return np.array([]).reshape(0, config.ncols), np.array([])
+        return np.array([]).reshape(0, config.ncols), np.array([], dtype=np.int64), np.array([])
     
     vectors = np.vstack(vectors).astype(np.float32)
+    global_indices = np.concatenate(global_indices)
     cluster_ids = np.concatenate(cluster_ids)
     
-    return vectors, cluster_ids
+    # Return the n_to_sample so caller can update n_already_sampled_per_cluster
+    return vectors, global_indices, cluster_ids, n_to_sample
 
 
 def gen_batch(
@@ -298,7 +605,7 @@ def find_nearby_clusters(
 # Ground Truth Generation
 # =============================================================================
 
-def gen_gt(
+def gen_gt_with_nprobes(
     nqueries: int,
     total_rows: int,
     config: ClusterConfig,
@@ -334,6 +641,7 @@ def gen_gt(
     # Generate query points by sampling from actual data points (like compare_pareto.py)
     query_rng = np.random.default_rng(config.seed + query_seed_offset)
     
+    # TODO: maybe instead of adding noise just generate from normal distribution as well
     # Sample global indices uniformly from the dataset
     query_global_indices = query_rng.choice(total_rows, size=nqueries, replace=False)
     
@@ -475,11 +783,7 @@ def verify_clustering_gt_accuracy(
             f"Increase total_rows, nprobes, or decrease nclusters/k."
         )
     
-    all_vectors = []
-    for cluster_id in tqdm(range(cluster_config.nclusters)):
-        cluster_points = gen_cluster(cluster_id, points_per_cluster[cluster_id], cluster_config)
-        all_vectors.append(cluster_points)
-    all_data = np.vstack(all_vectors).astype(np.float32)
+    all_data = generate_mock_data(cluster_config, config.total_rows)
     
     if verbose:
         print(f"  Generated {all_data.shape[0]:,} vectors")
@@ -488,7 +792,7 @@ def verify_clustering_gt_accuracy(
     if verbose:
         print(f"\n[Step 2] Generating queries and cluster-based GT (nprobes={config.nprobes})...")
 
-    queries, cluster_gt_indices, cluster_gt_distances = gen_gt(
+    queries, cluster_gt_indices, cluster_gt_distances = gen_gt_with_nprobes(
         nqueries=config.nqueries,
         total_rows=config.total_rows,
         config=cluster_config,
@@ -504,11 +808,12 @@ def verify_clustering_gt_accuracy(
     if verbose:
         print(f"\n[Step 3] Computing TRUE brute force GT on all {config.total_rows:,} vectors...")
     
-    true_gt_indices, true_gt_distances = brute_force_knn(
+    _, true_gt_indices, true_gt_distances = gen_gt_brute_force(
         all_data,
-        queries,
-        config.k,
-        backend=config.gt_backend
+        n_queries=config.nqueries,
+        k=config.k,
+        backend=config.gt_backend,
+        queries=queries
     )
 
     if verbose:
@@ -566,7 +871,12 @@ def verify_clustering_gt_accuracy(
 # Streaming Benchmark
 # =============================================================================
 
-def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, verbose: bool = True) -> dict:
+def run_streaming_benchmark(
+    config: BenchmarkConfig, 
+    itopk_list: list = None, 
+    nprobes_list: list = None,
+    verbose: bool = True
+) -> dict:
     """
     Streaming ANN benchmark without storing the full dataset.
     
@@ -578,6 +888,8 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
     
     Args:
         config: Benchmark configuration
+        itopk_list: List of itopk values to sweep for CAGRA
+        nprobes_list: List of n_probes values to sweep for IVF-PQ
         verbose: Print progress information
     
     Returns:
@@ -604,43 +916,51 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
     # -------------------------------------------------------------------------
     # Step 2: Stream data into ANN index (NO STORAGE)
     # -------------------------------------------------------------------------
-    if verbose:
-        index_name = type(config.ann_index).__name__
-        print(f"\n[Step 1] Streaming data into {index_name}...")
-    
-    # Use the ANN index from config
     if config.ann_index is None:
         raise ValueError("ann_index must be provided in BenchmarkConfig")
     ann_index = config.ann_index
+    index_name = type(ann_index).__name__
+    is_ivfpq = isinstance(ann_index, IvfPqIndex)
+    
+    if verbose:
+        print(f"\n[Step 1] Streaming data into {index_name}...")
     
     total_indexed = 0
     build_start = time.perf_counter()
 
-    # Step 2a: Build with sample from ALL clusters (ensures representative initial index)
+    # Use representative sampling with explicit indices for both CAGRA and IVF-PQ
     if verbose:
-        print(f"  Building initial index with sample from all clusters...")
-    build_vectors, _, n_sampled_per_cluster = gen_build_sample(
+        print(f"  Building with representative sample from all clusters...")
+    
+    # TODO: consolidate since we're taking the distributed sampling approach anyway
+    # Sample representative build data from all clusters (includes global indices)
+    build_vectors, build_indices, _, n_sampled_per_cluster = gen_build_sample(
         sample_size=config.batch_size,
         total_rows=config.total_rows,
         config=cluster_config
     )
-    ann_index.build(build_vectors)
+    
+    
+    ann_index.build(build_vectors, indices=build_indices)
     total_indexed += len(build_vectors)
     if verbose:
         print(f"  Built with {len(build_vectors):,} vectors from {(n_sampled_per_cluster > 0).sum()} clusters")
     
-    # Step 2b: Extend with remaining vectors (skipping those used in build)
-    total_remaining = config.total_rows - n_sampled_per_cluster.sum()
+    # Extend with remaining vectors (distributed across clusters)
+    # Track cumulative samples per cluster
+    n_cumulative_sampled = n_sampled_per_cluster.copy()
+    total_remaining = config.total_rows - n_cumulative_sampled.sum()
     num_extend_batches = (total_remaining + config.batch_size - 1) // config.batch_size
     
-    for batch_num in tqdm(range(num_extend_batches), desc="Extending index with remaining batches"):
-        vectors, _ = gen_extend_batch(
+    for batch_num in tqdm(range(num_extend_batches), desc=f"Extending {index_name} in batches"):
+        vectors, batch_indices, _, n_batch_sampled = gen_extend_batch(
             batch_num, config.batch_size, config.total_rows, 
-            cluster_config, n_sampled_per_cluster
+            cluster_config, n_cumulative_sampled
         )
         if len(vectors) > 0:
-            ann_index.extend(vectors)
+            ann_index.extend(vectors, indices=batch_indices)
             total_indexed += len(vectors)
+            n_cumulative_sampled += n_batch_sampled
 
     build_time = time.perf_counter() - build_start
     results['build_time_sec'] = build_time
@@ -657,7 +977,7 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
         print(f"\n[Step 2] Generating queries and ground truth on-the-fly using {config.gt_backend} backend, probing {config.nprobes}/{cluster_config.nclusters} clusters...")
     
     gt_start = time.perf_counter()
-    queries, gt_indices, gt_distances = gen_gt(
+    queries, gt_indices, gt_distances = gen_gt_with_nprobes(
         nqueries=config.nqueries,
         total_rows=config.total_rows,
         config=cluster_config,
@@ -678,43 +998,79 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
         print(f"  GT generation time: {gt_time:.2f}s")
     
     # -------------------------------------------------------------------------
-    # Step 4: Search ANN index and compute recall (sweep itopk if provided)
+    # Step 4: Search ANN index and compute recall (sweep search params)
     # -------------------------------------------------------------------------
-    if itopk_list is None:
-        itopk_list = [None]  # Use default search params
-    
-    if verbose:
-        print(f"\n[Step 3] Searching {index_name} with itopk sweep: {itopk_list}...")
-    
-    # Store results for each itopk value
     pareto_results = []
     
-    for itopk in itopk_list:
-        # Warmup search (not timed)
-        _ = ann_index.search(queries, config.k, itopk=itopk)
-        
-        # Timed search
-        search_start = time.perf_counter()
-        predicted_indices, predicted_distances = ann_index.search(queries, config.k, itopk=itopk)
-        search_time = time.perf_counter() - search_start
-        
-        recall, _ = compute_recall_with_ties(
-            predicted_indices, predicted_distances,
-            gt_indices, gt_distances
-        )
-        
-        qps = config.nqueries / search_time
-        
-        pareto_results.append({
-            'itopk': itopk,
-            'recall': recall,
-            'search_time_sec': search_time,
-            'qps': qps,
-        })
+    if is_ivfpq:
+        # IVF-PQ: Sweep n_probes
+        if nprobes_list is None:
+            nprobes_list = [16, 32, 64, 128, 256]
+        param_name = "n_probes"
         
         if verbose:
-            itopk_str = itopk if itopk is not None else "default"
-            print(f"  itopk={itopk_str}: recall={recall:.4f}, search_time={search_time:.4f}s, QPS={qps:,.0f}")
+            print(f"\n[Step 3] Searching {index_name} with n_probes sweep: {nprobes_list}...")
+        
+        for n_probes in nprobes_list:
+            # Warmup search (not timed)
+            _ = ann_index.search(queries, config.k, nprobes=n_probes)
+            
+            # Timed search
+            search_start = time.perf_counter()
+            predicted_indices, predicted_distances = ann_index.search(queries, config.k, nprobes=n_probes)
+            search_time = time.perf_counter() - search_start
+            
+            recall, _ = compute_recall_with_ties(
+                predicted_indices, predicted_distances,
+                gt_indices, gt_distances
+            )
+            
+            qps = config.nqueries / search_time
+            
+            pareto_results.append({
+                'param': n_probes,
+                'recall': recall,
+                'search_time_sec': search_time,
+                'qps': qps,
+            })
+            
+            if verbose:
+                print(f"  n_probes={n_probes}: recall={recall:.4f}, QPS={qps:,.0f}")
+    else:
+        # CAGRA: Sweep itopk
+        if itopk_list is None:
+            itopk_list = [32, 64, 128, 256]
+        param_name = "itopk"
+        
+        if verbose:
+            print(f"\n[Step 3] Searching {index_name} with itopk sweep: {itopk_list}...")
+        
+        for itopk in itopk_list:
+            # Warmup search (not timed)
+            _ = ann_index.search(queries, config.k, itopk=itopk)
+            
+            # Timed search
+            search_start = time.perf_counter()
+            predicted_indices, predicted_distances = ann_index.search(queries, config.k, itopk=itopk)
+            search_time = time.perf_counter() - search_start
+            
+            recall, _ = compute_recall_with_ties(
+                predicted_indices, predicted_distances,
+                gt_indices, gt_distances
+            )
+            
+            qps = config.nqueries / search_time
+            
+            pareto_results.append({
+                'param': itopk,
+                'recall': recall,
+                'search_time_sec': search_time,
+                'qps': qps,
+            })
+            
+            if verbose:
+                itopk_str = itopk if itopk is not None else "default"
+                print(f"  itopk={itopk_str}: recall={recall:.4f}, QPS={qps:,.0f}")
     
     results['pareto_results'] = pareto_results
     
@@ -723,16 +1079,16 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
     # -------------------------------------------------------------------------
     if verbose:
         print("\n" + "=" * 60)
-        print("Benchmark Results Summary")
+        print(f"Benchmark Results Summary ({index_name})")
         print("=" * 60)
         print(f"  Index build time: {build_time:.2f}s")
         print(f"  GT generation time: {gt_time:.2f}s")
-        print(f"\n  Pareto curve data (itopk sweep):")
-        print(f"  {'itopk':>8} {'recall':>10} {'QPS':>12}")
+        print(f"\n  Pareto curve data ({param_name} sweep):")
+        print(f"  {param_name:>8} {'recall':>10} {'QPS':>12}")
         print(f"  {'-'*8} {'-'*10} {'-'*12}")
         for pr in pareto_results:
-            itopk_str = str(pr['itopk']) if pr['itopk'] is not None else "default"
-            print(f"  {itopk_str:>8} {pr['recall']:>10.4f} {pr['qps']:>12,.0f}")
+            param_str = str(pr['param']) if pr['param'] is not None else "default"
+            print(f"  {param_str:>8} {pr['recall']:>10.4f} {pr['qps']:>12,.0f}")
         
         # Memory analysis
         print(f"\n[Memory Analysis]")
@@ -750,28 +1106,39 @@ def run_streaming_benchmark(config: BenchmarkConfig, itopk_list: list = None, ve
 # Demo / Test Functions
 # =============================================================================
 
-def demo_benchmark(config: BenchmarkConfig, itopk_list: list = None, output_path: str = None):
+def demo_benchmark(
+    config: BenchmarkConfig, 
+    itopk_list: list = None, 
+    nprobes_list: list = None,
+    output_path: str = None
+):
     """
     Demonstrate the streaming benchmark with example configuration.
     
     Args:
         config: Benchmark configuration
-        itopk_list: List of itopk values to sweep (e.g., [32, 64, 128, 256])
+        itopk_list: List of itopk values to sweep for CAGRA (e.g., [32, 64, 128, 256])
+        nprobes_list: List of n_probes values to sweep for IVF-PQ (e.g., [16, 32, 64, 128])
         output_path: Optional path to save pareto results as .npz file
     """
-    results = run_streaming_benchmark(config, itopk_list=itopk_list, verbose=True)
+    results = run_streaming_benchmark(
+        config, 
+        itopk_list=itopk_list, 
+        nprobes_list=nprobes_list,
+        verbose=True
+    )
     
     # Save pareto results if output path provided
     if output_path is not None and 'pareto_results' in results:
         pareto = results['pareto_results']
-        itopks = np.array([p['itopk'] if p['itopk'] is not None else 0 for p in pareto])
+        params = np.array([p['param'] if p['param'] is not None else 0 for p in pareto])
         recalls = np.array([p['recall'] for p in pareto])
         qps_arr = np.array([p['qps'] for p in pareto])
         search_times = np.array([p['search_time_sec'] for p in pareto])
         
         np.savez(
             output_path,
-            itopk=itopks,
+            param=params,
             recall=recalls,
             qps=qps_arr,
             search_time_sec=search_times,
@@ -796,6 +1163,7 @@ def test_gt_accuracy(config: BenchmarkConfig):
 
 if __name__ == "__main__":
     import argparse
+    from cuvs.neighbors import ivf_pq
     
     parser = argparse.ArgumentParser(description="Scalable Ground Truth Generation and ANN Benchmarking")
     parser.add_argument("--cluster_stats", type=str, required=True,
@@ -816,20 +1184,44 @@ if __name__ == "__main__":
                         help="Backend for brute force GT computation (default: cuvs)")
     parser.add_argument("--mode", type=str, default="test_gt", choices=["test_gt", "benchmark"],
                         help="Mode: test_gt (verify GT accuracy) or benchmark (streaming ANN benchmark)")
+    parser.add_argument("--algorithm", type=str, default="cagra", choices=["cagra", "ivfpq"],
+                        help="ANN algorithm: cagra or ivfpq (default: cagra)")
     parser.add_argument("--itopk", type=int, nargs="+", default=[32, 64, 128, 256],
-                        help="List of itopk values to sweep for Pareto curve (default: 32 64 128 256)")
+                        help="List of itopk values to sweep for CAGRA (default: 32 64 128 256)")
+    parser.add_argument("--search_nprobes", type=int, nargs="+", default=[16, 32, 64, 128, 256],
+                        help="List of n_probes values to sweep for IVF-PQ (default: 16 32 64 128 256)")
     parser.add_argument("--output", type=str, default=None,
                         help="Path to save pareto results as .npz file (optional)")
     
     args = parser.parse_args()
     
-    # Create the ANN index
-    build_params = cagra.IndexParams(
-        intermediate_graph_degree=256,
-        graph_degree=128,
-        build_algo="nn_descent",
-    )
-    ann_index = CagraIndex(build_params=build_params)
+    # Load cluster stats to get ncols
+    from config import load_cluster_stats
+    stats = load_cluster_stats(args.cluster_stats)
+    ncols = stats['centroids'].shape[1]
+    
+    # Create the ANN index based on algorithm choice
+    if args.algorithm == "cagra":
+        build_params = cagra.IndexParams(
+            intermediate_graph_degree=256,
+            graph_degree=128,
+            build_algo="nn_descent",
+        )
+        ann_index = CagraIndex(build_params=build_params)
+        itopk_list = args.itopk
+        nprobes_list = None
+    else:  # ivfpq
+        n_lists = min(1024, args.total_rows // 100)
+        pq_dim = min(ncols, 128)
+        build_params = ivf_pq.IndexParams(
+            n_lists=n_lists,
+            pq_dim=pq_dim,
+            pq_bits=8,
+        )
+        ann_index = IvfPqIndex(build_params=build_params)
+        itopk_list = None
+        nprobes_list = args.search_nprobes
+        print(f"IVF-PQ params: n_lists={n_lists}, pq_dim={pq_dim}")
     
     config = BenchmarkConfig(
         total_rows=args.total_rows,
@@ -848,7 +1240,12 @@ if __name__ == "__main__":
         test_gt_accuracy(config)
     else:
         # Streaming benchmark to compare the performance of different ANN algorithms.
-        demo_benchmark(config, itopk_list=args.itopk, output_path=args.output)
+        demo_benchmark(
+            config, 
+            itopk_list=itopk_list, 
+            nprobes_list=nprobes_list,
+            output_path=args.output
+        )
     
     # Explicit GPU cleanup to avoid CUDA errors on exit
     import gc

@@ -20,6 +20,7 @@ import argparse
 import time
 from datetime import datetime, timezone, timedelta
 from sklearn import config_context
+from tqdm import tqdm
 
 def load_memmap_bin(input_bin_file: str, dtype=np.float32, extra: int = -1):
     """
@@ -235,44 +236,121 @@ def extract_cluster_stats(
     if verbose:
         print("Computing cluster statistics...")
     
-    # Initialize arrays for statistics
-    variances = np.zeros(n_clusters)  # Scalar variance per cluster (backward compat)
-    densities = np.zeros(n_clusters)
-    variances_per_dim = np.zeros((n_clusters, n_dim))
-    mins_per_dim = np.zeros((n_clusters, n_dim))
-    maxs_per_dim = np.zeros((n_clusters, n_dim))
-    means_per_dim = np.zeros((n_clusters, n_dim))
-    
-    # For GMM, we can use the model's parameters directly for variances/densities
+    # For GMM, use model parameters directly
     if method == "gmm" and gmm_weights is not None:
         densities = gmm_weights.copy()
         variances_per_dim = gmm_variances_per_dim.copy()
         variances = np.mean(variances_per_dim, axis=1)
-    
-    for i in range(n_clusters):
-        mask = labels == i
-        cluster_points = data_sample[mask]
-        n_points = len(cluster_points)
-        
-        # For KMeans, compute density from labels
-        if method != "gmm":
-            densities[i] = n_points / len(data_sample)
-        
-        if n_points > 0:
-            # For KMeans, compute variances from data
-            if method != "gmm":
-                variances_per_dim[i] = np.var(cluster_points, axis=0)
-                variances[i] = np.mean(variances_per_dim[i])
+        # Still need to compute min/max/mean from actual data
+        mins_per_dim = np.zeros((n_clusters, n_dim))
+        maxs_per_dim = np.zeros((n_clusters, n_dim))
+        means_per_dim = np.zeros((n_clusters, n_dim))
+        for i in range(n_clusters):
+            mask = labels == i
+            cluster_points = data_sample[mask]
+            if len(cluster_points) > 0:
+                mins_per_dim[i] = np.min(cluster_points, axis=0)
+                maxs_per_dim[i] = np.max(cluster_points, axis=0)
+                means_per_dim[i] = np.mean(cluster_points, axis=0)
+            else:
+                means_per_dim[i] = centroids[i]
+                mins_per_dim[i] = centroids[i]
+                maxs_per_dim[i] = centroids[i]
+    else:
+        # Use GPU-accelerated computation for KMeans
+        try:
+            import cupy as cp
+            if verbose:
+                print("  Using CuPy GPU acceleration for cluster stats...")
             
-            # Min/max/mean always computed from actual data
-            mins_per_dim[i] = np.min(cluster_points, axis=0)
-            maxs_per_dim[i] = np.max(cluster_points, axis=0)
-            means_per_dim[i] = np.mean(cluster_points, axis=0)
-        else:
-            # Empty cluster - use centroid as mean, zero variance
-            means_per_dim[i] = centroids[i]
-            mins_per_dim[i] = centroids[i]
-            maxs_per_dim[i] = centroids[i]
+            # Move data to GPU
+            data_gpu = cp.asarray(data_sample)
+            labels_gpu = cp.asarray(labels)
+            centroids_gpu = cp.asarray(centroids)
+            
+            # Count points per cluster (for densities)
+            counts = cp.bincount(labels_gpu, minlength=n_clusters)
+            densities = cp.asnumpy(counts / len(data_sample))
+            
+            # Initialize output arrays on GPU
+            means_per_dim_gpu = cp.zeros((n_clusters, n_dim), dtype=cp.float32)
+            variances_per_dim_gpu = cp.zeros((n_clusters, n_dim), dtype=cp.float32)
+            mins_per_dim_gpu = cp.full((n_clusters, n_dim), cp.inf, dtype=cp.float32)
+            maxs_per_dim_gpu = cp.full((n_clusters, n_dim), -cp.inf, dtype=cp.float32)
+            
+            # Compute sum per cluster for mean calculation
+            # Use scatter_add for sum
+            for d in range(n_dim):
+                cp.scatter_add(means_per_dim_gpu[:, d], labels_gpu, data_gpu[:, d])
+            
+            # Compute mean (avoid div by zero)
+            safe_counts = cp.maximum(counts, 1).reshape(-1, 1)
+            means_per_dim_gpu = means_per_dim_gpu / safe_counts
+            
+            # Compute variance: E[X^2] - E[X]^2
+            sum_sq_per_dim_gpu = cp.zeros((n_clusters, n_dim), dtype=cp.float32)
+            for d in range(n_dim):
+                cp.scatter_add(sum_sq_per_dim_gpu[:, d], labels_gpu, data_gpu[:, d] ** 2)
+            mean_sq = sum_sq_per_dim_gpu / safe_counts
+            variances_per_dim_gpu = mean_sq - means_per_dim_gpu ** 2
+            variances_per_dim_gpu = cp.maximum(variances_per_dim_gpu, 0)  # numerical stability
+            
+            # Compute min/max per cluster (need to loop through clusters, but vectorized per cluster)
+            # This is harder to fully vectorize, use a hybrid approach
+            for i in range(n_clusters):
+                mask = labels_gpu == i
+                if cp.any(mask):
+                    cluster_data = data_gpu[mask]
+                    mins_per_dim_gpu[i] = cp.min(cluster_data, axis=0)
+                    maxs_per_dim_gpu[i] = cp.max(cluster_data, axis=0)
+                else:
+                    mins_per_dim_gpu[i] = centroids_gpu[i]
+                    maxs_per_dim_gpu[i] = centroids_gpu[i]
+            
+            # Handle empty clusters
+            empty_mask = counts == 0
+            if cp.any(empty_mask):
+                means_per_dim_gpu[empty_mask] = centroids_gpu[empty_mask]
+            
+            # Move results back to CPU
+            means_per_dim = cp.asnumpy(means_per_dim_gpu)
+            variances_per_dim = cp.asnumpy(variances_per_dim_gpu)
+            mins_per_dim = cp.asnumpy(mins_per_dim_gpu)
+            maxs_per_dim = cp.asnumpy(maxs_per_dim_gpu)
+            variances = np.mean(variances_per_dim, axis=1)
+            
+            # Free GPU memory
+            del data_gpu, labels_gpu, centroids_gpu, means_per_dim_gpu, variances_per_dim_gpu
+            del mins_per_dim_gpu, maxs_per_dim_gpu, sum_sq_per_dim_gpu
+            cp.get_default_memory_pool().free_all_blocks()
+            
+        except ImportError:
+            if verbose:
+                print("  CuPy not available, using CPU...")
+            # Fallback to CPU loop
+            variances = np.zeros(n_clusters)
+            densities = np.zeros(n_clusters)
+            variances_per_dim = np.zeros((n_clusters, n_dim))
+            mins_per_dim = np.zeros((n_clusters, n_dim))
+            maxs_per_dim = np.zeros((n_clusters, n_dim))
+            means_per_dim = np.zeros((n_clusters, n_dim))
+            
+            for i in range(n_clusters):
+                mask = labels == i
+                cluster_points = data_sample[mask]
+                n_points = len(cluster_points)
+                densities[i] = n_points / len(data_sample)
+                
+                if n_points > 0:
+                    variances_per_dim[i] = np.var(cluster_points, axis=0)
+                    variances[i] = np.mean(variances_per_dim[i])
+                    mins_per_dim[i] = np.min(cluster_points, axis=0)
+                    maxs_per_dim[i] = np.max(cluster_points, axis=0)
+                    means_per_dim[i] = np.mean(cluster_points, axis=0)
+                else:
+                    means_per_dim[i] = centroids[i]
+                    mins_per_dim[i] = centroids[i]
+                    maxs_per_dim[i] = centroids[i]
     
     # Quality analysis: detect potential convergence issues
     if verbose:
@@ -286,6 +364,204 @@ def extract_cluster_stats(
         'mins_per_dim': mins_per_dim,
         'maxs_per_dim': maxs_per_dim,
         'means_per_dim': means_per_dim
+    }
+
+
+def extract_lowrank_cluster_stats(
+    data: np.ndarray,
+    n_clusters: int,
+    pca_components: int = 32,
+    subsample_size: Optional[int] = None,
+    seed: int = 42,
+    use_gpu: bool = True,
+    verbose: bool = True,
+    max_iter: int = 300,
+) -> dict:
+    """
+    Extract cluster statistics with low-rank covariance via PCA.
+    
+    Instead of storing full covariance (d² params) or just diagonal (d params),
+    stores the top-k principal components per cluster (d*k params), capturing
+    the main correlation structure.
+    
+    Uses cuML GPU-accelerated PCA when use_gpu=True (much faster for high dimensions).
+    See: https://docs.rapids.ai/api/cuml/stable/api/#cuml.PCA
+    
+    Args:
+        data: Input data array (n_samples, n_features)
+        n_clusters: Number of clusters
+        pca_components: Number of PCA components per cluster (k)
+        subsample_size: If provided, subsample data before clustering
+        seed: Random seed
+        use_gpu: Use cuML GPU for both KMeans and PCA (faster)
+        verbose: Print progress
+        max_iter: Max iterations for KMeans
+    
+    Returns:
+        dict with:
+            centroids: (n_clusters, n_features) cluster centers
+            densities: (n_clusters,) relative density per cluster
+            pca_components_list: list of (k, n_features) arrays - principal directions per cluster
+            pca_explained_var_list: list of (k,) arrays - variance along each PC per cluster
+            pca_noise_var: (n_clusters,) residual noise variance per cluster
+            # Also includes diagonal stats for backward compat
+            variances: (n_clusters,) average variance per cluster
+            variances_per_dim: (n_clusters, n_features) per-dimension variance
+    """
+    rng = np.random.default_rng(seed)
+    n_dim = data.shape[1]
+    
+    # Try to import cuML PCA
+    cuml_available = False
+    if use_gpu:
+        try:
+            from cuml.decomposition import PCA as cumlPCA
+            from cuml.cluster import KMeans as cumlKMeans
+            cuml_available = True
+        except ImportError:
+            if verbose:
+                print("cuML not available, falling back to sklearn...")
+            cuml_available = False
+    
+    # Fallback imports
+    from sklearn.decomposition import PCA as sklearnPCA
+    from sklearn.cluster import KMeans as sklearnKMeans
+    
+    # Subsample if requested
+    if subsample_size is not None and subsample_size < len(data):
+        if verbose:
+            print(f"Subsampling from {len(data):,} to {subsample_size:,} points...")
+        indices = rng.choice(len(data), size=subsample_size, replace=False)
+        data_sample = data[indices]
+    else:
+        data_sample = data
+    
+    # Run KMeans clustering
+    if verbose:
+        backend = "cuML GPU" if cuml_available else "sklearn CPU"
+        print(f"Running KMeans ({backend}) with {n_clusters} clusters on {len(data_sample):,} points...")
+    
+    if cuml_available:
+        start = time.perf_counter()
+        kmeans = cumlKMeans(n_clusters=n_clusters, random_state=seed, max_iter=max_iter, verbose=verbose)
+        kmeans.fit(data_sample)
+        if verbose:
+            print(f"KMeans time: {time.perf_counter() - start:.2f}s")
+        labels = kmeans.labels_.get() if hasattr(kmeans.labels_, 'get') else np.array(kmeans.labels_)
+        centroids = kmeans.cluster_centers_.get() if hasattr(kmeans.cluster_centers_, 'get') else np.array(kmeans.cluster_centers_)
+    else:
+        kmeans = sklearnKMeans(n_clusters=n_clusters, random_state=seed, max_iter=max_iter, n_init=10)
+        kmeans.fit(data_sample)
+        labels = kmeans.labels_
+        centroids = kmeans.cluster_centers_
+    
+    if verbose:
+        backend = "cuML GPU" if cuml_available else "sklearn CPU"
+        print(f"Extracting low-rank covariance ({backend} PCA) with {pca_components} components per cluster...")
+    
+    # Initialize outputs
+    densities = np.zeros(n_clusters)
+    variances = np.zeros(n_clusters)
+    variances_per_dim = np.zeros((n_clusters, n_dim))
+    means_per_dim = np.zeros((n_clusters, n_dim))  # For quality analysis
+    pca_components_list = []
+    pca_explained_var_list = []
+    pca_noise_var = np.zeros(n_clusters)
+    # Radial distribution stats (for diagnostic printing only)
+    mean_dist = np.zeros(n_clusters)
+    median_dist = np.zeros(n_clusters)
+    kurtosis = np.zeros(n_clusters)
+    concentration = np.zeros(n_clusters)
+    
+    for i in tqdm(range(n_clusters), desc="Fitting PCA per cluster", disable=not verbose):
+        mask = labels == i
+        cluster_points = data_sample[mask]
+        n_points = len(cluster_points)
+        densities[i] = n_points / len(data_sample)
+        
+        if n_points < pca_components + 1:
+            # Fallback to diagonal for tiny clusters
+            if n_points > 1:
+                variances_per_dim[i] = np.var(cluster_points, axis=0)
+                means_per_dim[i] = np.mean(cluster_points, axis=0)
+            else:
+                variances_per_dim[i] = np.ones(n_dim) * 0.01
+                means_per_dim[i] = centroids[i]
+            variances[i] = np.mean(variances_per_dim[i])
+            
+            # Store empty PCA (will use diagonal fallback)
+            pca_components_list.append(None)
+            pca_explained_var_list.append(None)
+            pca_noise_var[i] = variances[i]
+            continue
+        
+        # Compute diagonal variance and mean for backward compat
+        variances_per_dim[i] = np.var(cluster_points, axis=0)
+        variances[i] = np.mean(variances_per_dim[i])
+        means_per_dim[i] = np.mean(cluster_points, axis=0)
+        
+        # Compute residuals (centered points)
+        residuals = cluster_points - centroids[i]
+        
+        # Fit PCA to get principal directions
+        n_components = min(pca_components, n_points - 1, n_dim)
+        
+        if cuml_available:
+            pca = cumlPCA(n_components=n_components)
+            pca.fit(residuals)
+            # cuML returns cupy arrays, convert to numpy
+            components = pca.components_.get() if hasattr(pca.components_, 'get') else np.array(pca.components_)
+            explained_var = pca.explained_variance_.get() if hasattr(pca.explained_variance_, 'get') else np.array(pca.explained_variance_)
+        else:
+            pca = sklearnPCA(n_components=n_components)
+            pca.fit(residuals)
+            components = pca.components_
+            explained_var = pca.explained_variance_
+        
+        pca_components_list.append(components.astype(np.float32))  # (k, d)
+        pca_explained_var_list.append(explained_var.astype(np.float32))  # (k,)
+        
+        # Noise variance: variance not explained by top-k components
+        total_var = np.var(residuals)
+        pca_noise_var[i] = max(total_var - explained_var.sum(), 1e-6)
+        
+        # Compute radial distribution stats (distance from centroid)
+        distances = np.sqrt(np.sum(residuals**2, axis=1))  # L2 distance from centroid
+        mean_dist[i] = distances.mean()
+        median_dist[i] = np.median(distances)
+        # Kurtosis of distances (>3 = heavy tails, <3 = concentrated)
+        if distances.std() > 0:
+            kurtosis[i] = np.mean(((distances - distances.mean()) / distances.std())**4)
+        else:
+            kurtosis[i] = 0
+        # Concentration: fraction of points closer than mean distance
+        concentration[i] = np.mean(distances < mean_dist[i])
+    
+    if verbose:
+        n_valid = sum(1 for c in pca_components_list if c is not None)
+        print(f"  {n_valid}/{n_clusters} clusters have full low-rank representation")
+        print(f"  {n_clusters - n_valid} clusters use diagonal fallback (too few points)")
+        
+        # Print distribution shape diagnostics
+        print(f"\n  Radial Distribution Diagnostics:")
+        print(f"    Mean distance from centroid: {mean_dist.mean():.4f} (range: {mean_dist.min():.4f} - {mean_dist.max():.4f})")
+        print(f"    Median/Mean ratio: {(median_dist/np.maximum(mean_dist, 1e-10)).mean():.3f} (Gaussian in high-d: ~0.98)")
+        print(f"    Kurtosis of distances: {kurtosis.mean():.2f} (Gaussian: ~3, <3 = concentrated)")
+        print(f"    Concentration (% within mean dist): {concentration.mean()*100:.1f}% (Gaussian: ~63%)")
+        
+        # Print quality analysis
+        _print_quality_analysis(centroids, means_per_dim, variances, densities, data_sample, n_clusters)
+    
+    return {
+        'centroids': centroids.astype(np.float32),
+        'densities': densities,
+        'variances': variances,
+        'variances_per_dim': variances_per_dim.astype(np.float32),
+        # Low-rank specific
+        'pca_components_list': pca_components_list,
+        'pca_explained_var_list': pca_explained_var_list,
+        'pca_noise_var': pca_noise_var.astype(np.float32),
+        'pca_n_components': pca_components,
     }
 
 
@@ -357,6 +633,40 @@ def save_cluster_stats(filepath: str, stats: dict):
     print(f"Saved cluster statistics to {filepath}")
 
 
+def save_lowrank_cluster_stats(filepath: str, stats: dict):
+    """
+    Save low-rank cluster statistics to a .npz file.
+    
+    For low-rank, we need to handle variable-length PCA components per cluster.
+    We store them as separate arrays with naming convention pca_comp_{i}, pca_var_{i}.
+    
+    Args:
+        filepath: Output path for .npz file
+        stats: Dict from extract_lowrank_cluster_stats
+    """
+    save_dict = {
+        'centroids': stats['centroids'],
+        'variances': stats['variances'],
+        'densities': stats['densities'],
+        'variances_per_dim': stats['variances_per_dim'],
+        'pca_noise_var': stats['pca_noise_var'],
+        'pca_n_components': stats['pca_n_components'],
+        'is_lowrank': True,
+    }
+    # Remove None values
+    save_dict = {k: v for k, v in save_dict.items() if v is not None}
+    
+    # Save PCA components for each cluster
+    n_clusters = len(stats['centroids'])
+    for i in range(n_clusters):
+        if stats['pca_components_list'][i] is not None:
+            save_dict[f'pca_comp_{i}'] = stats['pca_components_list'][i]
+            save_dict[f'pca_var_{i}'] = stats['pca_explained_var_list'][i]
+    
+    np.savez(filepath, **save_dict)
+    print(f"Saved low-rank cluster statistics to {filepath}")
+
+
 def load_cluster_stats(filepath: str) -> dict:
     """
     Load cluster statistics from a .npz file.
@@ -365,6 +675,7 @@ def load_cluster_stats(filepath: str) -> dict:
         - centroids, variances, densities: Always present
         - variances_per_dim, mins_per_dim, maxs_per_dim, means_per_dim: 
           Present if saved with new format, None otherwise
+        - For low-rank files: pca_components_list, pca_explained_var_list, pca_noise_var
     """
     data = np.load(filepath)
     
@@ -378,6 +689,28 @@ def load_cluster_stats(filepath: str) -> dict:
         'maxs_per_dim': data['maxs_per_dim'] if 'maxs_per_dim' in data else None,
         'means_per_dim': data['means_per_dim'] if 'means_per_dim' in data else None,
     }
+    
+    # Check if this is a low-rank file
+    if 'is_lowrank' in data and data['is_lowrank']:
+        n_clusters = len(result['centroids'])
+        pca_components_list = []
+        pca_explained_var_list = []
+        
+        for i in range(n_clusters):
+            if f'pca_comp_{i}' in data:
+                pca_components_list.append(data[f'pca_comp_{i}'])
+                pca_explained_var_list.append(data[f'pca_var_{i}'])
+            else:
+                pca_components_list.append(None)
+                pca_explained_var_list.append(None)
+        
+        result['is_lowrank'] = True
+        result['pca_components_list'] = pca_components_list
+        result['pca_explained_var_list'] = pca_explained_var_list
+        result['pca_noise_var'] = data['pca_noise_var']
+        result['pca_n_components'] = int(data['pca_n_components'])
+    else:
+        result['is_lowrank'] = False
     
     return result
 
@@ -407,8 +740,10 @@ if __name__ == "__main__":
                         help="Use CPU sklearn instead of GPU cuML")
     parser.add_argument("--max_iter", type=int, default=300,
                         help="Max iterations for clustering (default: 300)")
-    parser.add_argument("--method", type=str, default="kmeans", choices=["kmeans", "gmm", "gmm_gpu_init"],
-                        help="Clustering method: 'kmeans', 'gmm' (CPU), or 'gmm_gpu_init' (GPU KMeans init + GMM refinement)")
+    parser.add_argument("--method", type=str, default="kmeans", choices=["kmeans", "gmm", "gmm_gpu_init", "lowrank"],
+                        help="Clustering method: 'kmeans', 'gmm' (CPU), 'gmm_gpu_init' (GPU KMeans init + GMM refinement), or 'lowrank' (KMeans + PCA per cluster)")
+    parser.add_argument("--pca_components", type=int, default=32,
+                        help="Number of PCA components per cluster for lowrank method (default: 32)")
     
     args = parser.parse_args()
     
@@ -471,27 +806,51 @@ if __name__ == "__main__":
         method_str = "_gmm_gpu_init" if args.method == "gmm_gpu_init" else "_gmm"
         gmm_save_path = f"saved_gmm/gmm_{dataset_name}_sample{sample_size}_n{args.n_clusters}{method_str}_{args.max_iter}.joblib"
     
-    stats = extract_cluster_stats(
-        data=data,
-        n_clusters=args.n_clusters,
-        subsample_size=subsample_size,
-        seed=args.seed,
-        use_gpu=not args.cpu,
-        verbose=True,
-        max_iter=args.max_iter,
-        method=args.method,
-        save_gmm_path=gmm_save_path
-    )
+    # Extract stats based on method
+    if args.method == "lowrank":
+        stats = extract_lowrank_cluster_stats(
+            data=data,
+            n_clusters=args.n_clusters,
+            pca_components=args.pca_components,
+            subsample_size=subsample_size,
+            seed=args.seed,
+            use_gpu=not args.cpu,
+            verbose=True,
+            max_iter=args.max_iter,
+        )
+    else:
+        stats = extract_cluster_stats(
+            data=data,
+            n_clusters=args.n_clusters,
+            subsample_size=subsample_size,
+            seed=args.seed,
+            use_gpu=not args.cpu,
+            verbose=True,
+            max_iter=args.max_iter,
+            method=args.method,
+            save_gmm_path=gmm_save_path
+        )
 
     # Save results
     if args.output is None:
         dataset_name = args.dataset.split("/")[-1].replace(".fbin", "") if "/" in args.dataset else args.dataset
         sample_size = len(data) if args.subsample < 0 else args.subsample
-        method_str = "_gmm_gpu_init" if args.method == "gmm_gpu_init" else ("_gmm" if args.method == "gmm" else "")
+        if args.method == "lowrank":
+            method_str = f"_lowrank_k{args.pca_components}"
+        elif args.method == "gmm_gpu_init":
+            method_str = "_gmm_gpu_init"
+        elif args.method == "gmm":
+            method_str = "_gmm"
+        else:
+            method_str = ""
         args.output = f"cluster_stats/cluster_stats_{dataset_name}_sample{sample_size}_n{args.n_clusters}{method_str}_{args.max_iter}.npz"
     
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    save_cluster_stats(args.output, stats)
+    
+    if args.method == "lowrank":
+        save_lowrank_cluster_stats(args.output, stats)
+    else:
+        save_cluster_stats(args.output, stats)
     
     # Print summary for use in ClusterConfig
     print("\n" + "=" * 60)

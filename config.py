@@ -26,6 +26,11 @@ class ClusterConfig:
         cluster_mins: Optional (nclusters, ncols) - per-dimension min bounds
         cluster_maxs: Optional (nclusters, ncols) - per-dimension max bounds
         cluster_means: Optional (nclusters, ncols) - actual means of clusters (for diagnostics)
+        
+        # Low-rank covariance parameters (for better capturing correlations)
+        pca_components_list: Optional list of (k, ncols) arrays - principal directions per cluster
+        pca_explained_var_list: Optional list of (k,) arrays - variance along each PC per cluster
+        pca_noise_var: Optional (nclusters,) residual noise variance per cluster
     """
     nclusters: int
     ncols: int  # dimensions
@@ -37,10 +42,23 @@ class ClusterConfig:
     cluster_means: Optional[np.ndarray] = None  # (nclusters, ncols), actual cluster means
     cluster_mins: Optional[np.ndarray] = None  # (nclusters, ncols), per-dim min bounds
     cluster_maxs: Optional[np.ndarray] = None  # (nclusters, ncols), per-dim max bounds
+    # Low-rank covariance (captures correlations between dimensions)
+    pca_components_list: Optional[list] = None  # list of (k, ncols) or None per cluster
+    pca_explained_var_list: Optional[list] = None  # list of (k,) or None per cluster
+    pca_noise_var: Optional[np.ndarray] = None  # (nclusters,) residual noise variance
+    # Structure scaling (to make mock data harder/more realistic)
+    pca_scale: float = 1.0  # Multiplier for PCA explained variance (<1 = less structure = harder)
+    outlier_fraction: float = 0.0  # Fraction of points to replace with outliers (makes data harder)
+    student_df: Optional[float] = None  # Degrees of freedom for Student's t (None=Gaussian, lower=heavier tails, e.g. 5)
     
     def __post_init__(self):
         # Normalize densities to sum to 1
         self.cluster_densities = self.cluster_densities / self.cluster_densities.sum()
+    
+    @property
+    def is_lowrank(self) -> bool:
+        """Check if low-rank covariance is available."""
+        return self.pca_components_list is not None
     
 
 @dataclass
@@ -73,8 +91,14 @@ def load_cluster_stats(filepath: str) -> dict:
         - centroids, variances, densities: Always present
         - variances_per_dim, mins_per_dim, maxs_per_dim, means_per_dim: 
           Present if saved with new format, None otherwise
+        - pca_components_list, pca_explained_var_list, pca_noise_var: 
+          Present if low-rank extraction was used
+        - is_lowrank: True if PCA components are available
     """
-    data = np.load(filepath)
+    data = np.load(filepath, allow_pickle=True)
+    
+    # Check if low-rank (PCA) data is available
+    has_pca = 'pca_components_list' in data
     
     result = {
         'centroids': data['centroids'],
@@ -85,6 +109,11 @@ def load_cluster_stats(filepath: str) -> dict:
         'mins_per_dim': data['mins_per_dim'] if 'mins_per_dim' in data else None,
         'maxs_per_dim': data['maxs_per_dim'] if 'maxs_per_dim' in data else None,
         'means_per_dim': data['means_per_dim'] if 'means_per_dim' in data else None,
+        # Low-rank (PCA) fields
+        'is_lowrank': has_pca,
+        'pca_components_list': list(data['pca_components_list']) if has_pca else None,
+        'pca_explained_var_list': list(data['pca_explained_var_list']) if has_pca else None,
+        'pca_noise_var': data['pca_noise_var'] if has_pca else None,
     }
     
     return result
