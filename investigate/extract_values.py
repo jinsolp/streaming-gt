@@ -20,6 +20,7 @@ import argparse
 import time
 from datetime import datetime, timezone, timedelta
 from sklearn import config_context
+from tqdm import tqdm
 
 def load_memmap_bin(input_bin_file: str, dtype=np.float32, extra: int = -1):
     """
@@ -77,12 +78,8 @@ def extract_cluster_stats(
     Returns:
         dict with:
             centroids: (n_clusters, n_features) cluster centers
-            variances: (n_clusters,) average variance of each cluster (scalar per cluster)
             densities: (n_clusters,) relative density (fraction of points) per cluster
             variances_per_dim: (n_clusters, n_features) per-dimension variance
-            mins_per_dim: (n_clusters, n_features) per-dimension min
-            maxs_per_dim: (n_clusters, n_features) per-dimension max
-            means_per_dim: (n_clusters, n_features) actual mean of points per cluster
     """
     rng = np.random.default_rng(seed)
     n_dim = data.shape[1]
@@ -236,18 +233,14 @@ def extract_cluster_stats(
         print("Computing cluster statistics...")
     
     # Initialize arrays for statistics
-    variances = np.zeros(n_clusters)  # Scalar variance per cluster (backward compat)
     densities = np.zeros(n_clusters)
     variances_per_dim = np.zeros((n_clusters, n_dim))
-    mins_per_dim = np.zeros((n_clusters, n_dim))
-    maxs_per_dim = np.zeros((n_clusters, n_dim))
-    means_per_dim = np.zeros((n_clusters, n_dim))
+    means_per_dim = np.zeros((n_clusters, n_dim))  # For quality analysis only
     
     # For GMM, we can use the model's parameters directly for variances/densities
     if method == "gmm" and gmm_weights is not None:
         densities = gmm_weights.copy()
         variances_per_dim = gmm_variances_per_dim.copy()
-        variances = np.mean(variances_per_dim, axis=1)
     
     for i in range(n_clusters):
         mask = labels == i
@@ -262,39 +255,31 @@ def extract_cluster_stats(
             # For KMeans, compute variances from data
             if method != "gmm":
                 variances_per_dim[i] = np.var(cluster_points, axis=0)
-                variances[i] = np.mean(variances_per_dim[i])
             
-            # Min/max/mean always computed from actual data
-            mins_per_dim[i] = np.min(cluster_points, axis=0)
-            maxs_per_dim[i] = np.max(cluster_points, axis=0)
             means_per_dim[i] = np.mean(cluster_points, axis=0)
         else:
             # Empty cluster - use centroid as mean, zero variance
             means_per_dim[i] = centroids[i]
-            mins_per_dim[i] = centroids[i]
-            maxs_per_dim[i] = centroids[i]
     
     # Quality analysis: detect potential convergence issues
     if verbose:
-        _print_quality_analysis(centroids, means_per_dim, variances, densities, data_sample, n_clusters)
+        _print_quality_analysis(centroids, means_per_dim, variances_per_dim, densities, data_sample, n_clusters)
     
     return {
         'centroids': centroids,
-        'variances': variances,
         'densities': densities,
         'variances_per_dim': variances_per_dim,
-        'mins_per_dim': mins_per_dim,
-        'maxs_per_dim': maxs_per_dim,
-        'means_per_dim': means_per_dim
     }
 
 
-def _print_quality_analysis(centroids, means_per_dim, variances, densities, data_sample, n_clusters):
+def _print_quality_analysis(centroids, means_per_dim, variances_per_dim, densities, data_sample, n_clusters):
     """Print quality analysis to detect poor KMeans convergence."""
+    # Compute mean variance per cluster for summary stats
+    variances = variances_per_dim.mean(axis=1)
     print(f"\nCluster Statistics Summary:")
     print(f"  Centroids shape: {centroids.shape}")
-    print(f"  Variance range: [{variances.min():.4f}, {variances.max():.4f}]")
-    print(f"  Variance mean: {variances.mean():.4f}")
+    print(f"  Variance (mean per cluster) range: [{variances.min():.4f}, {variances.max():.4f}]")
+    print(f"  Variance (mean per cluster) mean: {variances.mean():.4f}")
     print(f"  Density range: [{densities.min():.4f}, {densities.max():.4f}]")
     print(f"  Points per cluster: {int(densities.min() * len(data_sample))} - {int(densities.max() * len(data_sample))}")
     
@@ -334,64 +319,20 @@ def _print_quality_analysis(centroids, means_per_dim, variances, densities, data
         print("    ⚠️ WARNING: Many clusters are undersized!")
 
 
-def save_cluster_stats(filepath: str, stats: dict):
-    """
-    Save cluster statistics to a .npz file.
-    
-    Args:
-        filepath: Output path for .npz file
-        stats: Dict from extract_cluster_stats containing:
-            - centroids, variances, densities (required, backward compat)
-            - variances_per_dim, mins_per_dim, maxs_per_dim, means_per_dim (new)
-    """
-    np.savez(
-        filepath,
-        centroids=stats['centroids'],
-        variances=stats['variances'],
-        densities=stats['densities'],
-        variances_per_dim=stats['variances_per_dim'],
-        mins_per_dim=stats['mins_per_dim'],
-        maxs_per_dim=stats['maxs_per_dim'],
-        means_per_dim=stats['means_per_dim']
-    )
-    print(f"Saved cluster statistics to {filepath}")
-
-
-def load_cluster_stats(filepath: str) -> dict:
-    """
-    Load cluster statistics from a .npz file.
-    
-    Returns dict with backward compatibility:
-        - centroids, variances, densities: Always present
-        - variances_per_dim, mins_per_dim, maxs_per_dim, means_per_dim: 
-          Present if saved with new format, None otherwise
-    """
-    data = np.load(filepath)
-    
-    result = {
-        'centroids': data['centroids'],
-        'variances': data['variances'],
-        'densities': data['densities'],
-        # New fields - None if not present (backward compat)
-        'variances_per_dim': data['variances_per_dim'] if 'variances_per_dim' in data else None,
-        'mins_per_dim': data['mins_per_dim'] if 'mins_per_dim' in data else None,
-        'maxs_per_dim': data['maxs_per_dim'] if 'maxs_per_dim' in data else None,
-        'means_per_dim': data['means_per_dim'] if 'means_per_dim' in data else None,
-    }
-    
-    return result
-
-
 def load_cluster_stats_legacy(filepath: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Load cluster statistics from a .npz file (legacy format).
-    Returns (centroids, variances, densities) tuple for backward compatibility.
+    Returns (centroids, variances_per_dim, densities) tuple for backward compatibility.
     """
     data = np.load(filepath)
-    return data['centroids'], data['variances'], data['densities']
+    return data['centroids'], data['variances_per_dim'], data['densities']
 
 
 if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from config import save_cluster_stats
+    
     parser = argparse.ArgumentParser(description="Extract cluster statistics from a dataset")
     parser.add_argument("--dataset", type=str, default="wiki", 
                         help="Dataset to load: 'wiki', 'food', 'small' (synthetic test data), or path to .fbin/.pkl file")
@@ -488,7 +429,7 @@ if __name__ == "__main__":
         dataset_name = args.dataset.split("/")[-1].replace(".fbin", "") if "/" in args.dataset else args.dataset
         sample_size = len(data) if args.subsample < 0 else args.subsample
         method_str = "_gmm_gpu_init" if args.method == "gmm_gpu_init" else ("_gmm" if args.method == "gmm" else "")
-        args.output = f"cluster_stats/cluster_stats_{dataset_name}_sample{sample_size}_n{args.n_clusters}{method_str}_{args.max_iter}.npz"
+        args.output = f"cluster_stats/{dataset_name}_sample{sample_size}_n{args.n_clusters}{method_str}_{args.max_iter}.npz"
     
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     save_cluster_stats(args.output, stats)
@@ -498,28 +439,15 @@ if __name__ == "__main__":
     print("To use these stats in ClusterConfig:")
     print("=" * 60)
     print(f"""
-from extract_values import load_cluster_stats
+from config import load_cluster_stats
 stats = load_cluster_stats("{args.output}")
 
-# Option 1: Basic (backward compatible)
-cluster_config = ClusterConfig(
-    nclusters={args.n_clusters},
-    ncols={n_dim},
-    seed=42,
-    cluster_centers=stats['centroids'],
-    cluster_variances=stats['variances'],
-    cluster_densities=stats['densities']
-)
-
-# Option 2: Full stats (per-dim variance + clipping to observed bounds)
 cluster_config = ClusterConfig(
     nclusters={args.n_clusters},
     ncols={n_dim},
     seed=42,
     cluster_centers=stats['centroids'],
     cluster_variances=stats['variances_per_dim'],  # (n_clusters, n_dim) per-dim variance
-    cluster_densities=stats['densities'],
-    cluster_mins=stats['mins_per_dim'],    # Clip generated points to observed bounds
-    cluster_maxs=stats['maxs_per_dim']
+    cluster_densities=stats['densities']
 )
 """)

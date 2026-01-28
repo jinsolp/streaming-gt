@@ -244,16 +244,7 @@ def _print_cluster_config(config: "ClusterConfig", title: str = None) -> None:
     ]
     
     # Show variance info
-    if config.cluster_variances.ndim == 1:
-        lines.append(f"  Variance type:     scalar per cluster")
-    else:
-        lines.append(f"  Variance type:     per-dimension ({config.cluster_variances.shape})")
-    
-    # Show optional fields if present
-    if config.cluster_mins is not None:
-        lines.append(f"  Has min bounds:    yes")
-    if config.cluster_maxs is not None:
-        lines.append(f"  Has max bounds:    yes")
+    lines.append(f"  Variance shape:    {config.cluster_variances.shape}")
     
     _print_box(title, lines)
 
