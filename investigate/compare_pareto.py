@@ -360,7 +360,7 @@ def generate_queries_from_gmm(gmm, n_queries: int) -> np.ndarray:
 
 def build_cagra_index(data: np.ndarray, graph_degree: int = 128) -> CagraIndex:
     """Build CAGRA index using CagraIndex wrapper."""
-    from cuvs.neighbors import cagra
+    from cuvs.neighbors import cagra, ivf_pq
     
     build_params = cagra.IndexParams(
         intermediate_graph_degree=graph_degree * 2,

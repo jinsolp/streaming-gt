@@ -34,17 +34,57 @@ def gen_cluster(cluster_id: int, n_points: int, config: ClusterConfig) -> np.nda
     Generate points for a single cluster deterministically using normal distribution (CPU).
     Same cluster_id + config always produces identical points.
     
-    Uses per-dimension variance: config.cluster_variances shape (nclusters, ncols)
+    Supports:
+    - Basic: Uses per-dimension variance config.cluster_variances shape (nclusters, ncols)
+    - Lowrank: Uses PCA components to capture correlations between dimensions
     """
     seed = get_cluster_seed(config.seed, cluster_id)
     rng = np.random.default_rng(seed)
     
     center = config.cluster_centers[cluster_id]
-    variance = config.cluster_variances[cluster_id]  # (ncols,) per-dimension
-    scale = np.sqrt(variance)
     
-    # Generate points using normal distribution
-    points = rng.normal(loc=center, scale=scale, size=(n_points, config.ncols))
+    # Check if lowrank sampling is available for this cluster
+    if config.is_lowrank and config.pca_components_list[cluster_id] is not None:
+        # Low-rank sampling: sample in PCA space, project back
+        pca_components = config.pca_components_list[cluster_id]  # (k, ncols)
+        explained_var = config.pca_explained_var_list[cluster_id]  # (k,)
+        noise_var = float(config.pca_noise_var[cluster_id])
+        
+        k = len(explained_var)
+        
+        # Sample in PCA space: z ~ N(0, explained_var)
+        z = rng.standard_normal(size=(n_points, k)) * np.sqrt(np.maximum(explained_var, 0.0))
+        
+        # Project back to original space: z @ components
+        projected = z @ pca_components  # (n_points, k) @ (k, ncols) = (n_points, ncols)
+        
+        # Add isotropic noise for unexplained variance
+        noise_std = np.sqrt(max(noise_var, 0.0))
+        noise = rng.standard_normal(size=(n_points, config.ncols)) * noise_std
+        
+        # Combine projected + noise (centered points before adding center)
+        centered_points = projected + noise
+        
+        # Scale to match original cluster variance (affects directions via stretching)
+        actual_var_before = np.var(centered_points)
+        
+        # Per-dimension scaling for more accurate variance matching
+        target_var_per_dim = config.cluster_variances[cluster_id]  # (ncols,)
+        actual_var_per_dim = np.var(centered_points, axis=0)  # (ncols,)
+        # Scale each dimension separately (avoid div by zero)
+        scale_factors = np.sqrt(target_var_per_dim / np.maximum(actual_var_per_dim, 1e-10))
+        centered_points = centered_points * scale_factors  # broadcasts (n_points, ncols) * (ncols,)
+        
+        # Final points: center + scaled centered_points
+        points = center + centered_points
+    else:
+        # Basic diagonal variance sampling
+        variance = config.cluster_variances[cluster_id]  # (ncols,) per-dimension
+        scale = np.sqrt(variance)
+        
+        # Generate points using normal distribution
+        z = rng.standard_normal(size=(n_points, config.ncols))
+        points = center + z * scale
     
     return points.astype(np.float32)
 
@@ -56,7 +96,9 @@ def gen_cluster_gpu(cluster_id: int, n_points: int, config: ClusterConfig, retur
     
     Note: GPU random numbers will differ from CPU version but are deterministic on GPU.
     
-    Uses per-dimension variance: config.cluster_variances shape (nclusters, ncols)
+    Supports:
+    - Basic: Uses per-dimension variance config.cluster_variances shape (nclusters, ncols)
+    - Lowrank: Uses PCA components to capture correlations between dimensions
     
     Args:
         cluster_id: ID of the cluster to generate
@@ -72,17 +114,50 @@ def gen_cluster_gpu(cluster_id: int, n_points: int, config: ClusterConfig, retur
     # Use CuPy's RandomState for deterministic seeding (compatible API)
     rng = cp.random.RandomState(seed)
     
-    # Transfer center and variance to GPU (these are small, can be cached)
     center = cp.asarray(config.cluster_centers[cluster_id])
-    variance = cp.asarray(config.cluster_variances[cluster_id])  # (ncols,) per-dimension
-    scale = cp.sqrt(variance)
     
-    # Generate standard normal samples directly into output array
-    # Then transform IN-PLACE to minimize GPU memory usage: X = center + scale * Z
-    # This uses ~30GB instead of ~90GB for large clusters
-    points = rng.standard_normal(size=(n_points, config.ncols), dtype=cp.float32)
-    points *= scale   # In-place multiplication (no new array)
-    points += center  # In-place addition (no new array)
+    # Check if lowrank sampling is available for this cluster
+    if config.is_lowrank and config.pca_components_list[cluster_id] is not None:
+        # Low-rank sampling: sample in PCA space, project back
+        pca_components = cp.asarray(config.pca_components_list[cluster_id])  # (k, ncols)
+        explained_var = cp.asarray(config.pca_explained_var_list[cluster_id])  # (k,)
+        noise_var = float(config.pca_noise_var[cluster_id])
+        
+        k = len(explained_var)
+        
+        # Sample in PCA space: z ~ N(0, explained_var)
+        z = rng.standard_normal(size=(n_points, k), dtype=cp.float32) * cp.sqrt(cp.maximum(explained_var, 0.0))
+        
+        # Project back to original space: z @ components
+        projected = z @ pca_components  # (n_points, k) @ (k, ncols) = (n_points, ncols)
+        
+        # Add isotropic noise for unexplained variance
+        noise_std = float(cp.sqrt(max(noise_var, 0.0)))
+        noise = rng.standard_normal(size=(n_points, config.ncols), dtype=cp.float32) * noise_std
+        
+        # Combine projected + noise (centered points before adding center)
+        centered_points = projected + noise
+        
+        # Scale to match original cluster variance (affects directions via stretching)
+        # Per-dimension scaling for more accurate variance matching
+        target_var_per_dim = cp.asarray(config.cluster_variances[cluster_id])  # (ncols,)
+        actual_var_per_dim = cp.var(centered_points, axis=0)  # (ncols,)
+        # Scale each dimension separately (avoid div by zero)
+        scale_factors = cp.sqrt(target_var_per_dim / cp.maximum(actual_var_per_dim, 1e-10))
+        centered_points = centered_points * scale_factors  # broadcasts (n_points, ncols) * (ncols,)
+        
+        # Final points: center + scaled centered_points
+        points = center + centered_points
+    else:
+        # Basic diagonal variance sampling
+        variance = cp.asarray(config.cluster_variances[cluster_id])  # (ncols,) per-dimension
+        scale = cp.sqrt(variance)
+        
+        # Generate standard normal samples directly into output array
+        # Then transform IN-PLACE to minimize GPU memory usage: X = center + scale * Z
+        points = rng.standard_normal(size=(n_points, config.ncols), dtype=cp.float32)
+        points *= scale   # In-place multiplication (no new array)
+        points += center  # In-place addition (no new array)
     
     if return_cupy:
         return points
