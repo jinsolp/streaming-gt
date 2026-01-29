@@ -272,6 +272,203 @@ def extract_cluster_stats(
     }
 
 
+def extract_lowrank_cluster_stats(
+    data: np.ndarray,
+    n_clusters: int,
+    pca_components: int = 32,
+    subsample_size: Optional[int] = None,
+    seed: int = 42,
+    use_gpu: bool = True,
+    verbose: bool = True,
+    max_iter: int = 300,
+) -> dict:
+    """
+    Extract cluster statistics with low-rank covariance via PCA.
+    
+    Instead of storing full covariance (d² params) or just diagonal (d params),
+    stores the top-k principal components per cluster (d*k params), capturing
+    the main correlation structure.
+    
+    Uses cuML GPU-accelerated PCA when use_gpu=True (much faster for high dimensions).
+    See: https://docs.rapids.ai/api/cuml/stable/api/#cuml.PCA
+    
+    Args:
+        data: Input data array (n_samples, n_features)
+        n_clusters: Number of clusters
+        pca_components: Number of PCA components per cluster (k)
+        subsample_size: If provided, subsample data before clustering
+        seed: Random seed
+        use_gpu: Use cuML GPU for both KMeans and PCA (faster)
+        verbose: Print progress
+        max_iter: Max iterations for KMeans
+    
+    Returns:
+        dict with:
+            centroids: (n_clusters, n_features) cluster centers
+            densities: (n_clusters,) relative density per cluster
+            pca_components_list: list of (k, n_features) arrays - principal directions per cluster
+            pca_explained_var_list: list of (k,) arrays - variance along each PC per cluster
+            pca_noise_var: (n_clusters,) residual noise variance per cluster
+            # Also includes diagonal stats for backward compat
+            variances: (n_clusters,) average variance per cluster
+            variances_per_dim: (n_clusters, n_features) per-dimension variance
+    """
+    rng = np.random.default_rng(seed)
+    n_dim = data.shape[1]
+
+    # Try to import cuML PCA
+    cuml_available = False
+    if use_gpu:
+        try:
+            from cuml.decomposition import PCA as cumlPCA
+            from cuml.cluster import KMeans as cumlKMeans
+            cuml_available = True
+        except ImportError:
+            if verbose:
+                print("cuML not available, falling back to sklearn...")
+            cuml_available = False
+
+    # Fallback imports
+    from sklearn.decomposition import PCA as sklearnPCA
+    from sklearn.cluster import KMeans as sklearnKMeans
+
+    # Subsample if requested
+    if subsample_size is not None and subsample_size < len(data):
+        if verbose:
+            print(f"Subsampling from {len(data):,} to {subsample_size:,} points...")
+        indices = rng.choice(len(data), size=subsample_size, replace=False)
+        data_sample = data[indices]
+    else:
+        data_sample = data
+
+    # Run KMeans clustering
+    if verbose:
+        backend = "cuML GPU" if cuml_available else "sklearn CPU"
+        print(f"Running KMeans ({backend}) with {n_clusters} clusters on {len(data_sample):,} points...")
+
+    if cuml_available:
+        start = time.perf_counter()
+        kmeans = cumlKMeans(n_clusters=n_clusters, random_state=seed, max_iter=max_iter, verbose=verbose)
+        kmeans.fit(data_sample)
+        if verbose:
+            print(f"KMeans time: {time.perf_counter() - start:.2f}s")
+        labels = kmeans.labels_.get() if hasattr(kmeans.labels_, 'get') else np.array(kmeans.labels_)
+        centroids = kmeans.cluster_centers_.get() if hasattr(kmeans.cluster_centers_, 'get') else np.array(kmeans.cluster_centers_)
+    else:
+        kmeans = sklearnKMeans(n_clusters=n_clusters, random_state=seed, max_iter=max_iter, n_init=10)
+        kmeans.fit(data_sample)
+        labels = kmeans.labels_
+        centroids = kmeans.cluster_centers_
+
+    if verbose:
+        backend = "cuML GPU" if cuml_available else "sklearn CPU"
+        print(f"Extracting low-rank covariance ({backend} PCA) with {pca_components} components per cluster...")
+
+    # Initialize outputs
+    densities = np.zeros(n_clusters)
+    variances = np.zeros(n_clusters)
+    variances_per_dim = np.zeros((n_clusters, n_dim))
+    means_per_dim = np.zeros((n_clusters, n_dim))  # For quality analysis
+    pca_components_list = []
+    pca_explained_var_list = []
+    pca_noise_var = np.zeros(n_clusters)
+    # Radial distribution stats (for diagnostic printing only)
+    mean_dist = np.zeros(n_clusters)
+    median_dist = np.zeros(n_clusters)
+    kurtosis = np.zeros(n_clusters)
+    concentration = np.zeros(n_clusters)
+
+    for i in tqdm(range(n_clusters), desc="Fitting PCA per cluster", disable=not verbose):
+        mask = labels == i
+        cluster_points = data_sample[mask]
+        n_points = len(cluster_points)
+        densities[i] = n_points / len(data_sample)
+
+        if n_points < pca_components + 1:
+            # Fallback to diagonal for tiny clusters
+            if n_points > 1:
+                variances_per_dim[i] = np.var(cluster_points, axis=0)
+                means_per_dim[i] = np.mean(cluster_points, axis=0)
+            else:
+                variances_per_dim[i] = np.ones(n_dim) * 0.01
+                means_per_dim[i] = centroids[i]
+            variances[i] = np.mean(variances_per_dim[i])
+
+            # Store empty PCA (will use diagonal fallback)
+            pca_components_list.append(None)
+            pca_explained_var_list.append(None)
+            pca_noise_var[i] = variances[i]
+            continue
+
+        # Compute diagonal variance and mean for backward compat
+        variances_per_dim[i] = np.var(cluster_points, axis=0)
+        variances[i] = np.mean(variances_per_dim[i])
+        means_per_dim[i] = np.mean(cluster_points, axis=0)
+
+        # Compute residuals (centered points)
+        residuals = cluster_points - centroids[i]
+
+        # Fit PCA to get principal directions
+        n_components = min(pca_components, n_points - 1, n_dim)
+
+        if cuml_available:
+            pca = cumlPCA(n_components=n_components)
+            pca.fit(residuals)
+            # cuML returns cupy arrays, convert to numpy
+            components = pca.components_.get() if hasattr(pca.components_, 'get') else np.array(pca.components_)
+            explained_var = pca.explained_variance_.get() if hasattr(pca.explained_variance_, 'get') else np.array(pca.explained_variance_)
+        else:
+            pca = sklearnPCA(n_components=n_components)
+            pca.fit(residuals)
+            components = pca.components_
+            explained_var = pca.explained_variance_
+
+        pca_components_list.append(components.astype(np.float32))  # (k, d)
+        pca_explained_var_list.append(explained_var.astype(np.float32))  # (k,)
+
+        # Noise variance: variance not explained by top-k components
+        total_var = np.var(residuals)
+        pca_noise_var[i] = max(total_var - explained_var.sum(), 1e-6)
+
+        # Compute radial distribution stats (distance from centroid)
+        distances = np.sqrt(np.sum(residuals**2, axis=1))  # L2 distance from centroid
+        mean_dist[i] = distances.mean()
+        median_dist[i] = np.median(distances)
+        # Kurtosis of distances (>3 = heavy tails, <3 = concentrated)
+        if distances.std() > 0:
+            kurtosis[i] = np.mean(((distances - distances.mean()) / distances.std())**4)
+        else:
+            kurtosis[i] = 0
+        # Concentration: fraction of points closer than mean distance
+        concentration[i] = np.mean(distances < mean_dist[i])
+
+    if verbose:
+        n_valid = sum(1 for c in pca_components_list if c is not None)
+        print(f"  {n_valid}/{n_clusters} clusters have full low-rank representation")
+        print(f"  {n_clusters - n_valid} clusters use diagonal fallback (too few points)")
+
+        # Print distribution shape diagnostics
+        print(f"\n  Radial Distribution Diagnostics:")
+        print(f"    Mean distance from centroid: {mean_dist.mean():.4f} (range: {mean_dist.min():.4f} - {mean_dist.max():.4f})")
+        print(f"    Median/Mean ratio: {(median_dist/np.maximum(mean_dist, 1e-10)).mean():.3f} (Gaussian in high-d: ~0.98)")
+        print(f"    Kurtosis of distances: {kurtosis.mean():.2f} (Gaussian: ~3, <3 = concentrated)")
+        print(f"    Concentration (% within mean dist): {concentration.mean()*100:.1f}% (Gaussian: ~63%)")
+
+        # Print quality analysis
+        _print_quality_analysis(centroids, means_per_dim, variances_per_dim, densities, data_sample, n_clusters)
+
+    return {
+        'centroids': centroids.astype(np.float32),
+        'densities': densities,
+        'variances_per_dim': variances_per_dim.astype(np.float32),
+        # Low-rank specific
+        'pca_components_list': pca_components_list,
+        'pca_explained_var_list': pca_explained_var_list,
+        'pca_noise_var': pca_noise_var.astype(np.float32),
+        'pca_n_components': pca_components,
+    }
+
+
 def _print_quality_analysis(centroids, means_per_dim, variances_per_dim, densities, data_sample, n_clusters):
     """Print quality analysis to detect poor KMeans convergence."""
     # Compute mean variance per cluster for summary stats
@@ -350,6 +547,8 @@ if __name__ == "__main__":
                         help="Max iterations for clustering (default: 300)")
     parser.add_argument("--method", type=str, default="kmeans", choices=["kmeans", "gmm", "gmm_gpu_init"],
                         help="Clustering method: 'kmeans', 'gmm' (CPU), or 'gmm_gpu_init' (GPU KMeans init + GMM refinement)")
+    parser.add_argument("--pca_components", type=int, default=-1,
+                        help="Number of PCA components per cluster for lowrank extraction (-1 = disabled, use diagonal only)")
     
     args = parser.parse_args()
     
@@ -404,32 +603,46 @@ if __name__ == "__main__":
     
     import os
     
-    # Generate GMM save path if using GMM method
-    gmm_save_path = None
-    if args.method in ["gmm", "gmm_gpu_init"]:
-        dataset_name = args.dataset.split("/")[-1].replace(".fbin", "") if "/" in args.dataset else args.dataset
-        sample_size = len(data) if args.subsample < 0 else args.subsample
-        method_str = "_gmm_gpu_init" if args.method == "gmm_gpu_init" else "_gmm"
-        gmm_save_path = f"saved_gmm/gmm_{dataset_name}_sample{sample_size}_n{args.n_clusters}{method_str}_{args.max_iter}.joblib"
-    
-    stats = extract_cluster_stats(
-        data=data,
-        n_clusters=args.n_clusters,
-        subsample_size=subsample_size,
-        seed=args.seed,
-        use_gpu=not args.cpu,
-        verbose=True,
-        max_iter=args.max_iter,
-        method=args.method,
-        save_gmm_path=gmm_save_path
-    )
+    # Use PCA-based lowrank extraction if pca_components > 0
+    if args.pca_components > 0:
+        stats = extract_lowrank_cluster_stats(
+            data=data,
+            n_clusters=args.n_clusters,
+            pca_components=args.pca_components,
+            subsample_size=subsample_size,
+            seed=args.seed,
+            use_gpu=not args.cpu,
+            verbose=True,
+            max_iter=args.max_iter,
+        )
+    else:
+        # Generate GMM save path if using GMM method
+        gmm_save_path = None
+        if args.method in ["gmm", "gmm_gpu_init"]:
+            dataset_name = args.dataset.split("/")[-1].replace(".fbin", "") if "/" in args.dataset else args.dataset
+            sample_size = len(data) if args.subsample < 0 else args.subsample
+            method_str = "_gmm_gpu_init" if args.method == "gmm_gpu_init" else "_gmm"
+            gmm_save_path = f"saved_gmm/gmm_{dataset_name}_sample{sample_size}_n{args.n_clusters}{method_str}_{args.max_iter}.joblib"
+        
+        stats = extract_cluster_stats(
+            data=data,
+            n_clusters=args.n_clusters,
+            subsample_size=subsample_size,
+            seed=args.seed,
+            use_gpu=not args.cpu,
+            verbose=True,
+            max_iter=args.max_iter,
+            method=args.method,
+            save_gmm_path=gmm_save_path
+        )
 
     # Save results
     if args.output is None:
         dataset_name = args.dataset.split("/")[-1].replace(".fbin", "") if "/" in args.dataset else args.dataset
         sample_size = len(data) if args.subsample < 0 else args.subsample
         method_str = "_gmm_gpu_init" if args.method == "gmm_gpu_init" else ("_gmm" if args.method == "gmm" else "")
-        args.output = f"cluster_stats/{dataset_name}_sample{sample_size}_n{args.n_clusters}{method_str}_{args.max_iter}.npz"
+        pca_str = f"_lowrankpca{args.pca_components}" if args.pca_components > 0 else ""
+        args.output = f"cluster_stats/{dataset_name}_sample{sample_size}_n{args.n_clusters}{method_str}{pca_str}_{args.max_iter}.npz"
     
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     save_cluster_stats(args.output, stats)
