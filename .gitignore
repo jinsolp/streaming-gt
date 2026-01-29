@@ -9,3 +9,4 @@ subsampled_data/
 saved_gmm/
 pareto_curves/
 cluster_stats/
+diskann*
