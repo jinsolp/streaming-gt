@@ -26,6 +26,124 @@ from scalable_gt import gen_cluster, get_num_points_per_cluster, generate_mock_d
 from ann_indices import CagraIndex, IvfPqIndex
 
 
+def save_fbin(data: np.ndarray, path: str):
+    """
+    Save data in .fbin format (DiskANN format).
+    Format: [n_points (int32)] [n_dims (int32)] [float32 vectors...]
+    """
+    n_points, n_dims = data.shape
+    with open(path, 'wb') as f:
+        f.write(np.array([n_points, n_dims], dtype=np.int32).tobytes())
+        f.write(data.astype(np.float32).tobytes())
+
+
+def save_ibin(data: np.ndarray, path: str):
+    """
+    Save data in .ibin format (DiskANN format for indices/GT).
+    Format: [n_queries (int32)] [k (int32)] [int32 indices...]
+    """
+    n_queries, k = data.shape
+    with open(path, 'wb') as f:
+        f.write(np.array([n_queries, k], dtype=np.int32).tobytes())
+        f.write(data.astype(np.int32).tobytes())
+
+
+def save_data(
+    mock_data: np.ndarray,
+    mock_queries: np.ndarray,
+    mock_gt_idx: np.ndarray,
+    mock_gt_dist: np.ndarray,
+    original_data: np.ndarray,
+    orig_queries: np.ndarray,
+    orig_gt_idx: np.ndarray,
+    orig_gt_dist: np.ndarray,
+    original_name: str,
+    cluster_stats_name: str,
+    base_dir: str = 'diskann_artifacts'
+):
+    """
+    Save original data, mock data, queries, and ground truth to disk in DiskANN-compatible formats.
+    
+    Directory structure:
+        {base_dir}/{original_name}/
+            orig_vectors.fbin, orig_queries.fbin, orig_gt.ibin, orig_gt_dist.fbin
+            {cluster_stats_name}/
+                mock_vectors.fbin, mock_queries.fbin, mock_gt.ibin, mock_gt_dist.fbin
+    
+    Args:
+        mock_data: Mock dataset (n_points, n_dim)
+        mock_queries: Mock queries (n_queries, n_dim)
+        mock_gt_idx: Mock ground truth indices (n_queries, k)
+        mock_gt_dist: Mock ground truth distances (n_queries, k)
+        original_data: Original dataset (n_points, n_dim)
+        orig_queries: Original queries (n_queries, n_dim)
+        orig_gt_idx: Original ground truth indices (n_queries, k)
+        orig_gt_dist: Original ground truth distances (n_queries, k)
+        original_name: Name of original dataset (used for directory)
+        cluster_stats_name: Name of cluster stats (used for mock subdirectory)
+        base_dir: Base directory for artifacts
+    """
+    # Create directory structure
+    orig_dir = os.path.join(base_dir, original_name)
+    mock_dir = os.path.join(orig_dir, cluster_stats_name)
+    os.makedirs(orig_dir, exist_ok=True)
+    os.makedirs(mock_dir, exist_ok=True)
+    
+    # Save original data (skip if already exists)
+    orig_data_path = os.path.join(orig_dir, 'orig_vectors.fbin')
+    orig_queries_path = os.path.join(orig_dir, 'orig_queries.fbin')
+    orig_gt_idx_path = os.path.join(orig_dir, 'orig_gt.ibin')
+    orig_gt_dist_path = os.path.join(orig_dir, 'orig_gt_dist.fbin')
+    
+    if os.path.exists(orig_data_path):
+        print(f"Original data already exists at {orig_data_path}, skipping...")
+    else:
+        save_fbin(original_data, orig_data_path)
+        print(f"Saved original data to {orig_data_path} (shape: {original_data.shape})")
+    
+    if os.path.exists(orig_queries_path):
+        print(f"Original queries already exist at {orig_queries_path}, skipping...")
+    else:
+        save_fbin(orig_queries, orig_queries_path)
+        save_ibin(orig_gt_idx, orig_gt_idx_path)
+        save_fbin(orig_gt_dist, orig_gt_dist_path)
+        print(f"Saved original queries to {orig_queries_path} (shape: {orig_queries.shape})")
+        print(f"Saved original GT indices to {orig_gt_idx_path} (shape: {orig_gt_idx.shape})")
+        print(f"Saved original GT distances to {orig_gt_dist_path} (shape: {orig_gt_dist.shape})")
+    
+    # Save mock data (always overwrite)
+    mock_data_path = os.path.join(mock_dir, 'mock_vectors.fbin')
+    mock_queries_path = os.path.join(mock_dir, 'mock_queries.fbin')
+    mock_gt_idx_path = os.path.join(mock_dir, 'mock_gt.ibin')
+    mock_gt_dist_path = os.path.join(mock_dir, 'mock_gt_dist.fbin')
+    
+    save_fbin(mock_data, mock_data_path)
+    print(f"Saved mock data to {mock_data_path} (shape: {mock_data.shape})")
+    
+    save_fbin(mock_queries, mock_queries_path)
+    save_ibin(mock_gt_idx, mock_gt_idx_path)
+    save_fbin(mock_gt_dist, mock_gt_dist_path)
+    print(f"Saved mock queries to {mock_queries_path} (shape: {mock_queries.shape})")
+    print(f"Saved mock GT indices to {mock_gt_idx_path} (shape: {mock_gt_idx.shape})")
+    print(f"Saved mock GT distances to {mock_gt_dist_path} (shape: {mock_gt_dist.shape})")
+    
+    print(f"\nDirectory structure:")
+    print(f"  {orig_dir}/")
+    print(f"    orig_vectors.fbin, orig_queries.fbin, orig_gt.ibin, orig_gt_dist.fbin")
+    print(f"    {cluster_stats_name}/")
+    print(f"      mock_vectors.fbin, mock_queries.fbin, mock_gt.ibin, mock_gt_dist.fbin")
+    print(f"\nDiskANN usage example:")
+    print(f"  # Build original index")
+    print(f"  mkdir -p {orig_dir}/index")
+    print(f"  build_disk_index --data_type float --dist_fn l2 --data_path {orig_data_path} \\")
+    print(f"    --index_path_prefix {orig_dir}/index/index -R 64 -L 128 -B 0.6 -M 50")
+    print(f"")
+    print(f"  # Build mock index")
+    print(f"  mkdir -p {mock_dir}/index")
+    print(f"  build_disk_index --data_type float --dist_fn l2 --data_path {mock_data_path} \\")
+    print(f"    --index_path_prefix {mock_dir}/index/index -R 64 -L 128 -B 0.6 -M 50")
+
+
 def analyze_centroid_quality(
     centroids: np.ndarray,
     densities: np.ndarray,
@@ -535,7 +653,10 @@ def compare_datasets(
     output_path: Optional[str] = None,
     backend: str = "cuvs",
     gmm_method: Optional[str] = None,
-    gmm_queries: Optional[np.ndarray] = None
+    gmm_queries: Optional[np.ndarray] = None,
+    save_output: bool = False,
+    original_name: Optional[str] = None,
+    cluster_stats_name: Optional[str] = None
 ):
     """
     Full comparison pipeline between original and mock datasets.
@@ -556,6 +677,9 @@ def compare_datasets(
         backend: "cuvs" or "sklearn" for brute force
         gmm_method: GMM method used ("gmm", "gmm_gpu_init", or None)
         gmm_queries: Optional pre-generated queries from GMM (used for both datasets)
+        save_output: Whether to save data in DiskANN format
+        original_name: Name of original dataset for directory structure
+        cluster_stats_name: Name of cluster stats for mock subdirectory
     """
     print("=" * 60)
     print("Pareto Curve Comparison: Original vs Mock Dataset")
@@ -578,6 +702,22 @@ def compare_datasets(
     mock_queries, mock_gt_idx, mock_gt_dist = generate_queries_and_gt_batched(
         mock_data, n_queries, k, seed=12345, backend=backend, queries=gmm_queries
     )
+    
+    # Save data if requested
+    if save_output and original_name and cluster_stats_name:
+        print(f"\n[Saving data to diskann_artifacts/{original_name}/{cluster_stats_name}]")
+        save_data(
+            mock_data=mock_data,
+            mock_queries=mock_queries,
+            mock_gt_idx=mock_gt_idx,
+            mock_gt_dist=mock_gt_dist,
+            original_data=original_data,
+            orig_queries=orig_queries,
+            orig_gt_idx=orig_gt_idx,
+            orig_gt_dist=orig_gt_dist,
+            original_name=original_name,
+            cluster_stats_name=cluster_stats_name
+        )
     
     # Build and sweep one dataset at a time to reduce memory usage
     if algorithm == "cagra":
@@ -664,6 +804,8 @@ if __name__ == "__main__":
                         help="ANN algorithm to benchmark")
     parser.add_argument("--output", type=str, default=None,
                         help="Output plot path (auto-generated if not provided)")
+    parser.add_argument("--save_output", action="store_true",
+                        help="Save data to 'saved_output/' in DiskANN format")
     
     args = parser.parse_args()
     
@@ -755,6 +897,13 @@ if __name__ == "__main__":
         densities = stats['densities']
         variances_per_dim = stats['variances_per_dim']
         
+        # Check for lowrank PCA stats
+        is_lowrank = 'pca_components_list' in stats
+        if is_lowrank:
+            print(f"  ✓ Lowrank PCA stats found (k={stats.get('pca_n_components', '?')} components)")
+        else:
+            print(f"  Using diagonal variance only (no PCA)")
+        
         # Save original cluster count for title/filename
         original_n_clusters = len(centroids)
         
@@ -771,6 +920,7 @@ if __name__ == "__main__":
         if cluster_extract_size > 0:
             print(f"Cluster extraction sample size: {cluster_extract_size / 1_000_000:.1f}M")
         
+        # Build ClusterConfig with optional lowrank PCA fields
         cluster_config = ClusterConfig(
             nclusters=len(centroids),
             ncols=n_dim,
@@ -778,6 +928,10 @@ if __name__ == "__main__":
             cluster_centers=centroids,
             cluster_variances=variances_per_dim,
             cluster_densities=densities,
+            # Lowrank PCA fields (None if not present)
+            pca_components_list=stats.get('pca_components_list'),
+            pca_explained_var_list=stats.get('pca_explained_var_list'),
+            pca_noise_var=stats.get('pca_noise_var'),
         )
         
         # Generate mock data
@@ -812,6 +966,12 @@ if __name__ == "__main__":
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
+    # Extract names for directory structure
+    # Original name: basename without extension (e.g., "wiki_pareto_5M_seed123_normalized")
+    original_name = os.path.basename(args.original).replace('.fbin', '').replace('.npy', '').replace('.pkl', '')
+    # Cluster stats name: basename without extension (e.g., "wiki_extract_1M_seed42_normalized_sample1000000_n1000_lowrankpca64_300")
+    cluster_stats_name = os.path.basename(args.cluster_stats).replace('.npz', '') if args.cluster_stats else None
+    
     compare_datasets(
         original_data,
         mock_data,
@@ -824,6 +984,9 @@ if __name__ == "__main__":
         algorithm=args.algorithm,
         output_path=output_path,
         gmm_method=gmm_method,
-        gmm_queries=gmm_queries
+        gmm_queries=gmm_queries,
+        save_output=args.save_output,
+        original_name=original_name,
+        cluster_stats_name=cluster_stats_name
     )
 
